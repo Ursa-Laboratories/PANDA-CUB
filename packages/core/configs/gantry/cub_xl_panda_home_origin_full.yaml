@@ -16,12 +16,24 @@ grbl_settings:
   steps_per_mm_z: 400.0
 instruments:
   camera:
+    camera_id: 0
     depth: 0.0
+    # offline until a PySpin wheel matching the venv (cp311) is installed;
+    # the wheels in ~ are cp38/cp310. Offline captures write placeholder PNGs.
     offline: true
     offset_x: 0.0
     offset_y: 0.0
     type: camera
-    vendor: mount_only
+    vendor: flir
+  lights:
+    depth: 0.0
+    offline: false
+    offset_x: 0.0
+    offset_y: 0.0
+    # Same Pawduino serial as the pipette; the shared link opens it once.
+    port: /dev/ttyACM0
+    type: lighting
+    vendor: pawduino
   pipette:
     depth: 0.0
     offline: false
