@@ -137,6 +137,9 @@ Commands available in YAML:
 - `clear_well`
 - `decap`
 - `cap`
+- `set_lights`
+- `capture`
+- `image_well`
 
 ### `home`
 
@@ -170,7 +173,9 @@ instrument method, and persist the result if a campaign is attached.
 - `method` *(str, default `"measure"`)* — instrument method to call.
 - `indentation_limit_height` *(float, default `null`)* — signed labware-relative
   offset for the deepest descent plane (closed-loop methods such as ASMI
-  `indentation`); must be at or below `measurement_height`.
+  `indentation`); must be at or below `measurement_height`. With ASMI surface
+  detection enabled (`detect_surface: true` in `method_kwargs`) it is anchored
+  to the sensor-detected sample surface instead and must be at or below `0`.
 - `method_kwargs` *(dict, default `{}`)* — forwarded verbatim to the instrument
   method. See [method_kwargs](#method_kwargs) below.
 
@@ -186,7 +191,9 @@ instrument method at each well. Returns a `{well_id: result}` mapping.
 - `interwell_scan_height` *(float, required)* — labware-relative offset for
   between-well XY travel; must be at or above `measurement_height`.
 - `indentation_limit_height` *(float, default `null`)* — deepest plane for ASMI
-  indentation; must be at or below `measurement_height`.
+  indentation; must be at or below `measurement_height`. With
+  `detect_surface: true` in `method_kwargs` it is anchored to the detected
+  sample surface instead and must be at or below `0`.
 - `delay_s` *(float, default `0.0`)* — seconds to pause between wells.
 - `method_kwargs` *(dict, default `null`)* — forwarded to the method per well.
 
@@ -208,6 +215,14 @@ Halt until the operator presses Enter.
 All pipette commands require an instrument registered under the name `pipette`.
 The `height`/`source_height`/`destination_height` args follow the labware-relative
 height convention.
+
+**`speed` is a normalized 0–100 percentage** of the instrument's usable speed
+range, not a physical unit — each vendor driver maps it onto its own hardware
+scale, so a protocol stays portable. The `sartorius` driver maps the default
+`50.0` onto the pipette's own mid-scale setting. The `opentrons` driver
+currently ignores `speed` and lets its firmware choose a velocity; honoring it
+would change motion on machines already in service, so that remains a
+deliberate follow-up.
 
 #### `pick_up_tip`
 
@@ -348,6 +363,75 @@ must currently be tracked `capped`.
 
 Replace the cap on `vial`. When durable tracking is active, the vial must
 currently be tracked `uncapped`.
+
+### Lighting and imaging commands
+
+`set_lights` drives a lighting instrument (`type: lighting`); `capture` and
+`image_well` drive a camera instrument (`type: camera`). See [Gantry Setup:
+Define Instruments](gantry-setup.md#define-instruments). At the end of every
+run — completed or aborted — all lighting channels are commanded off
+best-effort, so a failed protocol never leaves lights on over a sample.
+
+#### `set_lights`
+
+Set one lighting channel, or turn everything off. Two mutually exclusive
+forms:
+
+- `instrument` *(str, required)* — lighting instrument registered on the
+  gantry.
+- `channel` *(str)* + `brightness` *(int)* — turn a channel on at that
+  percentage. The level must be one the vendor supports exactly (the
+  Pawduino lights expose `white`: 5/10/15/25/50/100 and `contact`
+  (red+blue): 5/10/20/30/50); `brightness: 0` turns just that channel off.
+- `all_off: true` — turn every channel off. (Named `all_off` because YAML
+  parses a bare `off:` key as a boolean.)
+
+No motion. Lights the protocol turns on stay on until a later step or the
+end-of-run fail-safe turns them off.
+
+#### `capture`
+
+Take one image wherever the gantry currently is and save it under the
+images directory (`~/.cubos/images`, override with `CUBOS_IMAGES_DIR`),
+grouped by campaign. No motion of its own — compose with `move` and
+`set_lights`.
+
+- `instrument` *(str, required)* — camera instrument registered on the
+  gantry.
+- `label` *(str, optional)* — filename label for the saved image.
+- `position` *(str, optional)* — deck target the image belongs to. Used
+  only to record the image against that labware/well in the data store
+  (`camera_measurements`); it does not move the camera. Without it the
+  file is still saved but not recorded.
+
+A capture failure fails the step. Offline camera vendors write a real
+placeholder PNG so dry runs exercise the full file/persistence path.
+
+#### `image_well`
+
+The packaged well-imaging sequence: travel above the well at `safe_z`,
+descend to the imaging plane, light the well, capture, lights off, retract
+to `safe_z` — with lights-off and the retract guaranteed even on failure.
+
+- `camera` *(str, required)* — camera instrument.
+- `well` *(str, required)* — deck target of the well to image.
+- `image_height` *(float, required)* — labware-relative offset in mm above
+  the well's surface Z: the camera's focus standoff. Like every height
+  argument it lives on the command, never on labware or instrument config.
+- `lights` *(str, optional)* — lighting instrument. Defaults to the
+  gantry's lighting instrument when it has exactly one; pass a name to
+  disambiguate, or the literal `none` to image with ambient light.
+- `label` *(str, optional)* — filename label (defaults to the well target).
+- `mode` *(str, default `standard`)* — `standard` is one shot with white
+  lights at 5% (or `brightness`); `curvature` is a contact-angle Z-stack:
+  from `image_height` descend `z_step_mm` per plane for `z_steps` planes
+  (defaults 0.2 mm × 11) with contact lights at 50% (or `brightness`),
+  labeling each image `{label}_z{z}mm_b{brightness}`.
+- `brightness` *(int, optional)* — override the mode's default level.
+
+Capture and lighting failures **log and continue** (an image is never
+worth failing a run over) and the command returns the list of image paths
+actually saved. Motion failures still fail the run.
 
 ### Compound liquid commands
 
@@ -493,3 +577,32 @@ rejected inside `method_kwargs` — `measurement_height`, `interwell_scan_height
 those. The engine also injects `well_z`, `measurement_height`,
 `indentation_limit_height`, and `gantry` into the method call when (and only when)
 the method declares those parameters; injected values win over `method_kwargs`.
+
+#### ASMI surface detection
+
+ASMI `indentation` supports sensor-based surface detection through
+`method_kwargs`, useful for deep samples (partially filled wells, vials) where
+descending the whole approach at the fine measurement `step_size` is slow, or
+where the sample surface Z varies with fill level:
+
+- `detect_surface` *(bool, default `false`)* — approach to `measurement_height`
+  as usual, then coarse-step downward until the baseline-corrected force
+  changes by more than the threshold, back off one search step, and run the
+  fine-step indentation from that detected surface. While enabled,
+  `indentation_limit_height` is anchored to the detected surface (negative =
+  into the sample) and must be at or below `0`.
+- `surface_search_step` *(float, default `0.5`)* — mm per coarse search step.
+- `surface_force_threshold` *(float, default `0.01`)* — force change in Newtons
+  (10 mN) that marks the surface.
+- `surface_search_max_travel` *(float, default `10.0`)* — search window in mm
+  below `measurement_height`; the well errors out instead of descending past
+  it. Static validation bounds the worst-case depth
+  (`measurement_height - surface_search_max_travel + indentation_limit_height`)
+  against the working volume.
+
+Search readings are not recorded as measurement samples; the detected surface
+Z, trigger force, and search parameters are reported in the result metadata
+(`surface_z_mm`, `surface_trigger_force_n`, `surface_search_step_mm`,
+`surface_force_threshold_n`). See
+`packages/core/configs/protocol/asmi/indentation_detect_surface.yaml` for a
+complete example.

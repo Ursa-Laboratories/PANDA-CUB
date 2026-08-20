@@ -1,4 +1,4 @@
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { useState } from "react";
 import { describe, expect, it, vi } from "vitest";
@@ -131,6 +131,122 @@ describe("GantryEditor", () => {
     expect(screen.getByLabelText("Label")).toHaveValue("x");
   });
 
+  it("renders section headings in order: Gantry, Connection, Instruments, Working Volume", () => {
+    renderGantry();
+    const headings = screen.getAllByRole("heading", { level: 4 });
+    const sectionNames = headings
+      .map((h) => h.textContent)
+      .filter((text): text is string =>
+        text === "Gantry" || text === "Instruments" || text === "Connection" || text === "Working Volume",
+      );
+    expect(sectionNames).toEqual(["Gantry", "Connection", "Instruments", "Working Volume"]);
+  });
+
+  it("shows only gantry type and serial port in the top-level Gantry section", () => {
+    renderGantry();
+    const heading = screen.getByRole("heading", { level: 4, name: "Gantry" });
+    const card = heading.parentElement as HTMLElement;
+    expect(within(card).getByLabelText(/Gantry type/)).toBeInTheDocument();
+    expect(within(card).getByLabelText("Serial port")).toBeInTheDocument();
+    // Nothing else leaks into the top-level card — no Connection-only
+    // fields such as Factory Z travel, and no other sections.
+    expect(card).not.toHaveTextContent("Factory Z travel");
+    expect(card).not.toHaveTextContent("Instruments");
+    expect(card).not.toHaveTextContent("Working Volume");
+  });
+
+  it("never renders a Y-axis motion control (unnecessary for operators)", async () => {
+    const user = userEvent.setup();
+    renderGantry();
+    expect(screen.queryByLabelText(/Y-axis motion/i)).not.toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: /Advanced settings/ }));
+    expect(screen.queryByLabelText(/Y-axis motion/i)).not.toBeInTheDocument();
+  });
+
+  describe("raw YAML mode", () => {
+    it("shows the current config as YAML text and hides the structured form", async () => {
+      const user = userEvent.setup();
+      renderGantry();
+
+      await user.click(screen.getByRole("button", { name: "Edit raw YAML" }));
+
+      const textarea = screen.getByLabelText("Raw gantry YAML") as HTMLTextAreaElement;
+      expect(textarea.value).toContain("serial_port: /dev/ttyUSB0");
+      expect(textarea.value).toContain("gantry_type: cub_xl");
+      // The structured form (including the Gantry identity card) is gone
+      // while raw mode is active — one editable source of truth at a time.
+      expect(screen.queryByLabelText(/Gantry type/)).not.toBeInTheDocument();
+      expect(screen.queryByLabelText("Serial port")).not.toBeInTheDocument();
+      expect(screen.queryByRole("heading", { name: "Connection" })).not.toBeInTheDocument();
+    });
+
+    it("edits flow from the raw textarea into the underlying config and back out on save", async () => {
+      const user = userEvent.setup();
+      const props = renderGantry();
+
+      await user.click(screen.getByRole("button", { name: "Edit raw YAML" }));
+      const textarea = screen.getByLabelText("Raw gantry YAML");
+      const nextYaml = [
+        "serial_port: /dev/ttyUSB7",
+        "gantry_type: cub",
+        "cnc:",
+        "  factory_z_travel_mm: 80",
+        "working_volume:",
+        "  x_min: 0",
+        "  x_max: 300",
+        "  y_min: 0",
+        "  y_max: 200",
+        "  z_min: 0",
+        "  z_max: 80",
+        "instruments: {}",
+        "",
+      ].join("\n");
+      // A raw YAML blob (with literal braces/brackets) is entered as one
+      // paste rather than keystroke-by-keystroke — user.type() treats `{`
+      // and `[` as special key-sequence syntax, which a real YAML document
+      // will always contain.
+      fireEvent.change(textarea, { target: { value: nextYaml } });
+
+      expect(props.onLocalChange).toHaveBeenCalled();
+      const lastPayload = vi.mocked(props.onLocalChange).mock.lastCall?.[0] as GantryResponse;
+      expect(lastPayload.config.serial_port).toBe("/dev/ttyUSB7");
+      expect(lastPayload.config.gantry_type).toBe("cub");
+
+      await user.click(screen.getByRole("button", { name: "Save" }));
+      expect(props.onSave).toHaveBeenCalledWith(
+        "cubos.yaml",
+        expect.objectContaining({ serial_port: "/dev/ttyUSB7", gantry_type: "cub" }),
+      );
+    });
+
+    it("blocks saving and switching back to the form while the YAML doesn't parse", async () => {
+      const user = userEvent.setup();
+      renderGantry();
+
+      await user.click(screen.getByRole("button", { name: "Edit raw YAML" }));
+      const textarea = screen.getByLabelText("Raw gantry YAML");
+      fireEvent.change(textarea, { target: { value: "serial_port: [unterminated" } });
+
+      expect(screen.getByRole("button", { name: "Save" })).toBeDisabled();
+      const backButton = screen.getByRole("button", { name: "Back to form" });
+      expect(backButton).toBeDisabled();
+      await user.click(backButton);
+      // Still in raw mode — the click was a no-op while invalid.
+      expect(screen.getByLabelText("Raw gantry YAML")).toBeInTheDocument();
+    });
+
+    it("returns to the structured form once the YAML is valid again", async () => {
+      const user = userEvent.setup();
+      renderGantry();
+
+      await user.click(screen.getByRole("button", { name: "Edit raw YAML" }));
+      await user.click(screen.getByRole("button", { name: "Back to form" }));
+
+      expect(screen.queryByLabelText("Raw gantry YAML")).not.toBeInTheDocument();
+      expect(screen.getByLabelText("Serial port")).toHaveValue("/dev/ttyUSB0");
+    });
+  });
+
   it("keeps GRBL under the Advanced settings expander", async () => {
     const user = userEvent.setup();
     renderGantry();
@@ -214,7 +330,6 @@ describe("GantryEditor", () => {
     const props = renderGantry();
 
     await user.selectOptions(screen.getByLabelText(/Gantry type/), "cub");
-    await user.selectOptions(screen.getByLabelText("Y-axis motion"), "bed");
     await user.clear(screen.getByLabelText("X max"));
     await user.type(screen.getByLabelText("X max"), "250");
 
@@ -316,7 +431,6 @@ describe("GantryEditor", () => {
   it("discards local edits back to the last-saved baseline and notifies the parent", async () => {
     const user = userEvent.setup();
     const onRefresh = vi.fn();
-    const confirmSpy = vi.spyOn(window, "confirm").mockReturnValue(true);
     renderGantry({ dirty: true, onRefresh });
 
     // Per-field dirty markers (an amber "*") append to the accessible
@@ -327,18 +441,16 @@ describe("GantryEditor", () => {
     expect(screen.getByLabelText(/^Serial port/)).toHaveValue("/dev/ttyUSB9");
 
     await user.click(screen.getByRole("button", { name: "Discard changes" }));
+    expect(await screen.findByRole("alertdialog")).toHaveTextContent("Discard unsaved gantry changes?");
+    await user.click(screen.getByRole("button", { name: "Discard" }));
 
-    expect(confirmSpy).toHaveBeenCalled();
     expect(onRefresh).toHaveBeenCalled();
     expect(screen.getByLabelText("Serial port")).toHaveValue("/dev/ttyUSB0");
-
-    confirmSpy.mockRestore();
   });
 
   it("keeps edits when the user cancels the discard confirm", async () => {
     const user = userEvent.setup();
     const onRefresh = vi.fn();
-    const confirmSpy = vi.spyOn(window, "confirm").mockReturnValue(false);
     renderGantry({ dirty: true, onRefresh });
 
     const serialPort = screen.getByLabelText("Serial port");
@@ -346,11 +458,11 @@ describe("GantryEditor", () => {
     await user.type(serialPort, "/dev/ttyUSB9");
 
     await user.click(screen.getByRole("button", { name: "Discard changes" }));
+    await user.click(screen.getByRole("button", { name: "Cancel" }));
 
     expect(onRefresh).not.toHaveBeenCalled();
+    expect(screen.queryByRole("alertdialog")).not.toBeInTheDocument();
     expect(screen.getByLabelText(/^Serial port/)).toHaveValue("/dev/ttyUSB9");
-
-    confirmSpy.mockRestore();
   });
 });
 

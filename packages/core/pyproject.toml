@@ -11,6 +11,8 @@ dependencies = [
 [project.optional-dependencies]
 dev = [
     "pytest",
+    "pytest-cov",
+    "diff-cover",
 ]
 # Per-vendor SDKs — opt in only when you actually use that driver.
 # The drivers import these lazily and raise a clear error if missing, so the core
@@ -26,6 +28,15 @@ asmi = [
 ]
 potentiostat = [
     "SquidstatPyLibrary",
+]
+# camera: OpenCV covers both the `opencv` webcam vendor and image saving for
+# the `flir` vendor. PySpin itself is proprietary (Spinnaker SDK, manual
+# install from https://www.flir.com/products/spinnaker-sdk/) and cannot be a
+# pip dependency; the flir driver imports it lazily and raises a clear error
+# with the install pointer when missing.
+camera = [
+    "opencv-python",
+    "numpy",
 ]
 docs = [
     "mkdocs>=1.6",

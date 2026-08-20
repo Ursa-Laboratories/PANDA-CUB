@@ -1,6 +1,5 @@
 param(
-    [string]$InstallDir = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path,
-    [string[]]$DriverGroups = @()
+    [string]$InstallDir = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
 )
 
 $ErrorActionPreference = "Stop"
@@ -71,32 +70,68 @@ function Invoke-LoggedNative {
 
     $Label = if ($Activity) { $Activity } else { "working" }
 
-    # Pre-quote arguments so paths containing spaces (e.g. a wheelhouse under a
-    # user profile with a space in the name) survive Start-Process.
-    $QuotedArgs = @(
-        foreach ($Arg in $Arguments) {
-            if ($Arg -match '[\s"]') { '"' + ($Arg -replace '"', '\"') + '"' } else { $Arg }
-        }
-    )
-
     $OutFile = [System.IO.Path]::GetTempFileName()
     $ErrFile = [System.IO.Path]::GetTempFileName()
+    $ExitCodeFile = [System.IO.Path]::GetTempFileName()
+    Remove-Item -LiteralPath $ExitCodeFile -Force
     $StartTime = Get-Date
     $LastBeat = Get-Date
     $SeenOut = 0
     $SeenErr = 0
-    $ExitCode = 0
+    $ExitCode = $null
 
     try {
+        # Windows PowerShell 5.1 only populates Process.ExitCode when
+        # Start-Process uses -Wait. Waiting there would prevent the progress
+        # heartbeat, so a child PowerShell writes the native exit code to a
+        # side-channel file while this process continues streaming output.
+        $Payload = @{
+            FilePath = $FilePath
+            Arguments = @($Arguments)
+        } | ConvertTo-Json -Compress
+        $PayloadBase64 = [Convert]::ToBase64String(
+            [System.Text.Encoding]::UTF8.GetBytes($Payload)
+        )
+        $EscapedExitCodeFile = $ExitCodeFile.Replace("'", "''")
+        $Runner = @"
+`$PayloadJson = [System.Text.Encoding]::UTF8.GetString(
+    [Convert]::FromBase64String('$PayloadBase64')
+)
+`$Payload = `$PayloadJson | ConvertFrom-Json
+`$NativeExitCode = 1
+`$ProgressPreference = 'SilentlyContinue'
+try {
+    & ([string]`$Payload.FilePath) @(`$Payload.Arguments)
+    if (`$null -eq `$LASTEXITCODE) {
+        `$NativeExitCode = if (`$?) { 0 } else { 1 }
+    }
+    else {
+        `$NativeExitCode = [int]`$LASTEXITCODE
+    }
+}
+catch {
+    Write-Error `$_.Exception.Message
+}
+finally {
+    [System.IO.File]::WriteAllText('$EscapedExitCodeFile', [string]`$NativeExitCode)
+}
+exit `$NativeExitCode
+"@
+        $EncodedRunner = [Convert]::ToBase64String(
+            [System.Text.Encoding]::Unicode.GetBytes($Runner)
+        )
         $StartArgs = @{
-            FilePath               = $FilePath
+            FilePath               = (Join-Path $PSHOME "powershell.exe")
+            ArgumentList           = @(
+                "-NoProfile",
+                "-NonInteractive",
+                "-ExecutionPolicy", "Bypass",
+                "-EncodedCommand", $EncodedRunner
+            )
             NoNewWindow            = $true
             PassThru               = $true
             RedirectStandardOutput = $OutFile
             RedirectStandardError  = $ErrFile
-        }
-        if ($QuotedArgs.Count -gt 0) {
-            $StartArgs['ArgumentList'] = $QuotedArgs
         }
 
         $Process = Start-Process @StartArgs
@@ -134,7 +169,15 @@ function Invoke-LoggedNative {
         }
 
         $Process.WaitForExit()
-        $ExitCode = $Process.ExitCode
+        if (-not (Test-Path -LiteralPath $ExitCodeFile)) {
+            throw "Could not determine the exit code for $FilePath"
+        }
+        $ExitCodeText = (Get-Content -LiteralPath $ExitCodeFile -Raw).Trim()
+        $ParsedExitCode = 0
+        if (-not [int]::TryParse($ExitCodeText, [ref]$ParsedExitCode)) {
+            throw "Invalid exit code '$ExitCodeText' reported for $FilePath"
+        }
+        $ExitCode = $ParsedExitCode
 
         # Flush any trailing output, including a final line without a newline.
         $OutLines = @(Get-Content -LiteralPath $OutFile -ErrorAction SilentlyContinue)
@@ -154,7 +197,7 @@ function Invoke-LoggedNative {
         }
     }
     finally {
-        Remove-Item -LiteralPath $OutFile, $ErrFile -Force -ErrorAction SilentlyContinue
+        Remove-Item -LiteralPath $OutFile, $ErrFile, $ExitCodeFile -Force -ErrorAction SilentlyContinue
     }
 
     if ($ExitCode -ne 0) {
@@ -169,15 +212,15 @@ $Wheelhouse = Join-Path $InstallDir "wheelhouse"
 $Requirements = Join-Path $InstallDir "requirements\runtime-requirements.txt"
 $DriverRequirementsDir = Join-Path $InstallDir "requirements\drivers"
 $Marker = Join-Path $InstallDir "runtime-installed.txt"
-$DriverGroupsFile = Join-Path $InstallDir "driver-groups.txt"
-$DriverGroupsExplicitlyProvided = @($DriverGroups | Where-Object { $_ -and $_.Trim() }).Count -gt 0
+
+# TODO: non-pip drivers (e.g. uvvis) aren't covered here -- see
+# packages/core/src/cubos/instruments/README.md "External proprietary drivers".
 $SelectedDriverGroups = @(
-    $DriverGroups |
-        ForEach-Object { $_ -split "," } |
-        Where-Object { $_ -and $_.Trim() } |
-        ForEach-Object { $_.Trim().ToLowerInvariant() } |
-        Where-Object { $_ -ne 'none' } |
-        Select-Object -Unique
+    if (Test-Path $DriverRequirementsDir) {
+        Get-ChildItem -Path $DriverRequirementsDir -Filter "*.txt" |
+            ForEach-Object { $_.BaseName.ToLowerInvariant() } |
+            Sort-Object
+    }
 )
 
 try {
@@ -187,12 +230,7 @@ try {
     Write-Log "Runtime virtual environment: $VenvDir"
     Write-Log "Wheelhouse: $Wheelhouse"
     Write-Log "Requirements: $Requirements"
-    Write-Log "Selected public driver groups: $(if ($SelectedDriverGroups.Count) { $SelectedDriverGroups -join ', ' } else { 'none' })"
-
-    if ($DriverGroupsExplicitlyProvided) {
-        Set-Content -Path $DriverGroupsFile -Value ($SelectedDriverGroups -join ",") -Encoding UTF8
-        Write-Log "Persisted selected driver groups to $DriverGroupsFile"
-    }
+    Write-Log "Installing public driver groups: $(if ($SelectedDriverGroups.Count) { $SelectedDriverGroups -join ', ' } else { 'none' })"
 
     if (-not (Test-Path $Python)) {
         throw "Python runtime not found at $Python"

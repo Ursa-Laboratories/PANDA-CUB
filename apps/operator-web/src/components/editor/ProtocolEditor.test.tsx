@@ -22,6 +22,7 @@ const COMMANDS: CommandInfo[] = [
       { name: "instrument", type: "str", required: true, default: null },
       { name: "method", type: "str", required: true, default: null },
       { name: "measurement_height", type: "float", required: true, default: null },
+      { name: "indentation_limit_height", type: "float | None", required: false, default: null },
       { name: "method_kwargs", type: "Dict[str, Any] | None", required: false, default: null },
     ],
   },
@@ -53,7 +54,6 @@ const DECK: DeckResponse = {
         length: 100,
         width: 80,
         height: 14,
-        a1: null,
         calibration: { a1: { x: 0, y: 0, z: 0 }, a2: { x: 9, y: 0, z: 0 } },
         x_offset: 9,
         y_offset: 9,
@@ -275,6 +275,93 @@ describe("ProtocolEditor", () => {
     expect(props.onLocalChange).toHaveBeenCalled();
   });
 
+  it("hides surface detection params until detect surface is enabled", async () => {
+    const user = userEvent.setup();
+    const props = renderProtocol({ steps: [] });
+
+    await user.selectOptions(screen.getByRole("combobox", { name: "Add step" }), "scan");
+    await user.click(screen.getByRole("button", { name: "Add" }));
+
+    // Surface-search parameters are irrelevant noise while detection is off,
+    // so they should be absent from the DOM entirely, not just disabled.
+    expect(await screen.findByLabelText("Detect surface")).toHaveValue("false");
+    expect(screen.queryByLabelText("Surface search step (mm)")).not.toBeInTheDocument();
+    expect(screen.queryByLabelText("Surface force threshold (N)")).not.toBeInTheDocument();
+    expect(screen.queryByLabelText("Surface search max travel (mm)")).not.toBeInTheDocument();
+
+    await user.selectOptions(screen.getByLabelText("Detect surface"), "true");
+
+    expect(screen.getByLabelText("Surface search step (mm)")).toHaveValue("0.5");
+    expect(screen.getByLabelText("Surface force threshold (N)")).toHaveValue("0.01");
+    expect(screen.getByLabelText("Surface search max travel (mm)")).toHaveValue("10");
+    expect(screen.getByLabelText("Surface search step (mm)")).toBeEnabled();
+    expect(screen.getByLabelText("Surface force threshold (N)")).toBeEnabled();
+    expect(screen.getByLabelText("Surface search max travel (mm)")).toBeEnabled();
+    expect(props.onLocalChange).toHaveBeenLastCalledWith([
+      expect.objectContaining({
+        args: expect.objectContaining({
+          method_kwargs: expect.objectContaining({
+            detect_surface: true,
+            surface_search_step: 0.5,
+            surface_force_threshold: 0.01,
+            surface_search_max_travel: 10,
+          }),
+        }),
+      }),
+    ]);
+
+    await user.selectOptions(screen.getByLabelText("Detect surface"), "false");
+
+    expect(screen.queryByLabelText("Surface search step (mm)")).not.toBeInTheDocument();
+    expect(screen.queryByLabelText("Surface force threshold (N)")).not.toBeInTheDocument();
+    expect(screen.queryByLabelText("Surface search max travel (mm)")).not.toBeInTheDocument();
+  });
+
+  it("strips surface detection params when detect surface is disabled", async () => {
+    const user = userEvent.setup();
+    const props = renderProtocol({
+      steps: [
+        {
+          command: "scan",
+          args: {
+            plate: "plate_1",
+            instrument: "asmi",
+            method: "indentation",
+            measurement_height: -1,
+            interwell_scan_height: 8,
+            indentation_limit_height: -1,
+            method_kwargs: {
+              step_size: 0.02,
+              force_limit: 10,
+              detect_surface: true,
+              surface_search_step: 0.5,
+              surface_force_threshold: 0.01,
+              surface_search_max_travel: 8,
+            },
+          },
+        },
+      ],
+    });
+
+    expect(screen.getByLabelText("Detect surface")).toHaveValue("true");
+    expect(screen.getByLabelText("Surface search step (mm)")).toBeInTheDocument();
+    await user.selectOptions(screen.getByLabelText("Detect surface"), "false");
+
+    expect(props.onLocalChange).toHaveBeenLastCalledWith([
+      expect.objectContaining({
+        args: expect.objectContaining({
+          method_kwargs: {
+            step_size: 0.02,
+            force_limit: 10,
+          },
+        }),
+      }),
+    ]);
+    expect(screen.queryByLabelText("Surface search step (mm)")).not.toBeInTheDocument();
+    expect(screen.queryByLabelText("Surface force threshold (N)")).not.toBeInTheDocument();
+    expect(screen.queryByLabelText("Surface search max travel (mm)")).not.toBeInTheDocument();
+  });
+
   it("uses the CubOS-provided instrument method map before the fallback map", async () => {
     const user = userEvent.setup();
     renderProtocol({
@@ -347,6 +434,86 @@ describe("ProtocolEditor", () => {
     ]);
   });
 
+  it("omits indentation_limit_height instead of saving an empty string when cleared, for measure", async () => {
+    const user = userEvent.setup();
+    const props = renderProtocol({
+      steps: [
+        {
+          command: "measure",
+          args: {
+            instrument: "asmi",
+            position: "plate_1.A1",
+            method: "indentation",
+            measurement_height: -1,
+            indentation_limit_height: -5,
+            method_kwargs: { force_limit: 10 },
+          },
+        },
+      ],
+    });
+
+    const field = screen.getByLabelText(/Indentation limit height/);
+    expect(field).toHaveValue("-5");
+    await user.clear(field);
+
+    const calls = vi.mocked(props.onLocalChange!).mock.calls;
+    const lastCall = calls[calls.length - 1][0];
+    expect(lastCall[0].args).not.toHaveProperty("indentation_limit_height");
+  });
+
+  it("omits indentation_limit_height instead of saving an empty string when cleared, for scan", async () => {
+    const user = userEvent.setup();
+    const props = renderProtocol({
+      steps: [
+        {
+          command: "scan",
+          args: {
+            plate: "plate_1",
+            instrument: "asmi",
+            method: "indentation",
+            measurement_height: -1,
+            indentation_limit_height: -5,
+            method_kwargs: { force_limit: 10 },
+          },
+        },
+      ],
+    });
+
+    const field = screen.getByLabelText(/Indentation limit height/);
+    expect(field).toHaveValue("-5");
+    await user.clear(field);
+
+    const calls = vi.mocked(props.onLocalChange!).mock.calls;
+    const lastCall = calls[calls.length - 1][0];
+    expect(lastCall[0].args).not.toHaveProperty("indentation_limit_height");
+  });
+
+  it("saves a newly entered indentation_limit_height as a number", async () => {
+    const user = userEvent.setup();
+    const props = renderProtocol({
+      steps: [
+        {
+          command: "measure",
+          args: {
+            instrument: "asmi",
+            position: "plate_1.A1",
+            method: "indentation",
+            measurement_height: -1,
+            method_kwargs: { force_limit: 10 },
+          },
+        },
+      ],
+    });
+
+    const field = screen.getByLabelText(/Indentation limit height/);
+    expect(field).toHaveValue("");
+    await user.type(field, "-2.5");
+
+    const calls = vi.mocked(props.onLocalChange!).mock.calls;
+    const lastCall = calls[calls.length - 1][0];
+    expect(lastCall[0].args.indentation_limit_height).toBe(-2.5);
+  });
+
   it("renames a named position and rewrites the steps that reference it", async () => {
     const user = userEvent.setup();
     const props = renderProtocol({
@@ -401,37 +568,34 @@ describe("ProtocolEditor", () => {
     const user = userEvent.setup();
     const baseline: ProtocolResponse = { filename: "move.yaml", steps: STEPS, positions: null };
     const onRefresh = vi.fn();
-    const confirmSpy = vi.spyOn(window, "confirm").mockReturnValue(true);
     renderProtocol({ unsavedConfigs: ["Protocol"], baseline, onRefresh });
 
     await user.click(screen.getByRole("button", { name: "Add" }));
     expect(screen.getAllByText(/^Step \d:$/)).toHaveLength(2);
 
     await user.click(screen.getByRole("button", { name: "Discard changes" }));
+    expect(await screen.findByRole("alertdialog")).toHaveTextContent("Discard unsaved protocol changes?");
+    await user.click(screen.getByRole("button", { name: "Discard" }));
 
-    expect(confirmSpy).toHaveBeenCalled();
     expect(onRefresh).toHaveBeenCalled();
     expect(screen.getAllByText(/^Step \d:$/)).toHaveLength(1);
-
-    confirmSpy.mockRestore();
   });
 
   it("keeps edits when the user cancels the discard confirm", async () => {
     const user = userEvent.setup();
     const baseline: ProtocolResponse = { filename: "move.yaml", steps: STEPS, positions: null };
     const onRefresh = vi.fn();
-    const confirmSpy = vi.spyOn(window, "confirm").mockReturnValue(false);
     renderProtocol({ unsavedConfigs: ["Protocol"], baseline, onRefresh });
 
     await user.click(screen.getByRole("button", { name: "Add" }));
     expect(screen.getAllByText(/^Step \d:$/)).toHaveLength(2);
 
     await user.click(screen.getByRole("button", { name: "Discard changes" }));
+    await user.click(screen.getByRole("button", { name: "Cancel" }));
 
     expect(onRefresh).not.toHaveBeenCalled();
+    expect(screen.queryByRole("alertdialog")).not.toBeInTheDocument();
     expect(screen.getAllByText(/^Step \d:$/)).toHaveLength(2);
-
-    confirmSpy.mockRestore();
   });
 
   // ── Feature 07b: per-container starting-volume seed rows ──

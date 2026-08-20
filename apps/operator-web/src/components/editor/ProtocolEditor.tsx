@@ -14,8 +14,9 @@ import type {
   ProtocolRunResponse,
   InstrumentMeasurementMethods,
 } from "../../types";
-import { CoordinateField, NumberField, TextField, UnsavedNotice } from "./fields";
+import { CoordinateField, NumberField, OptionalNumberField, TextField, UnsavedNotice } from "./fields";
 import ImportFromFile from "./ImportFromFile";
+import { useConfirm } from "../common/useConfirm";
 import {
   createCompositionRow,
   createSeedRow,
@@ -164,6 +165,7 @@ export default function ProtocolEditor({
   const [saveAs, setSaveAs] = useState("");
   const [saving, setSaving] = useState(false);
   const [saveError, setSaveError] = useState<string | null>(null);
+  const [requestConfirm, confirmDialog] = useConfirm();
 
   const commandsByName = Object.fromEntries(commands.map((c) => [c.name, c]));
   const choices = buildProtocolChoices(deck, gantry, positionRows, instrumentMethods);
@@ -202,7 +204,14 @@ export default function ProtocolEditor({
 
   const updateStepArg = (i: number, argName: string, value: unknown) => {
     const next = [...steps];
-    const updatedArgs = { ...next[i].args, [argName]: value };
+    const updatedArgs = { ...next[i].args };
+    if (value === null) {
+      // Optional field cleared by the operator: omit the argument rather
+      // than saving an empty string or a stale number.
+      delete updatedArgs[argName];
+    } else {
+      updatedArgs[argName] = value;
+    }
     if (argName === "instrument") {
       const methods = measurementMethodsForInstrument(String(value), choices);
       if (methods.length > 0 && !methods.includes(String(updatedArgs.method ?? ""))) {
@@ -299,8 +308,14 @@ export default function ProtocolEditor({
     }
   };
 
-  const handleDiscard = () => {
-    if (!window.confirm("Discard unsaved protocol changes?")) return;
+  const handleDiscard = async () => {
+    const confirmed = await requestConfirm({
+      title: "Discard changes?",
+      message: "Discard unsaved protocol changes?",
+      confirmLabel: "Discard",
+      danger: true,
+    });
+    if (!confirmed) return;
     setSteps(baseline?.steps ? structuredClone(baseline.steps) : []);
     setPositionRows(positionsToRows(baseline?.positions));
     setSaveError(null);
@@ -467,7 +482,7 @@ export default function ProtocolEditor({
             </div>
 
             {cmd ? (
-              <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
+              <div style={stepArgsGridStyle}>
                 {cmd.args.map((arg) => {
                   if (isHiddenArgForStep(arg.name, step.args, choices)) {
                     return null;
@@ -504,6 +519,18 @@ export default function ProtocolEditor({
                     );
                   }
                   if (isNumericType(arg.type)) {
+                    if (!arg.required) {
+                      return (
+                        <OptionalNumberField
+                          key={arg.name}
+                          id={`step-${i}-${arg.name}`}
+                          name={`step_${i}_${arg.name}`}
+                          label={argLabel(arg.name)}
+                          value={typeof val === "number" ? val : null}
+                          onChange={(v) => updateStepArg(i, arg.name, v)}
+                        />
+                      );
+                    }
                     return (
                       <NumberField
                         key={arg.name}
@@ -812,6 +839,7 @@ export default function ProtocolEditor({
           <p style={{ ...theme.notice.error, margin: "6px 0 0" }}>{runError}</p>
         )}
       </div>
+      {confirmDialog}
     </div>
   );
 }
@@ -1101,6 +1129,30 @@ function MethodOptionsField({
   if (!asmiIndentation) return null;
   const options = isRecord(value) ? value : {};
   const update = (key: string, nextValue: unknown) => onChange({ ...options, [key]: nextValue });
+  const detectSurface = Boolean(options.detect_surface ?? false);
+  const setDetectSurface = (enabled: boolean) => {
+    if (enabled) {
+      onChange({
+        ...options,
+        detect_surface: true,
+        surface_search_step: Number(options.surface_search_step ?? 0.5),
+        surface_force_threshold: Number(options.surface_force_threshold ?? 0.01),
+        surface_search_max_travel: Number(options.surface_search_max_travel ?? 10),
+      });
+      return;
+    }
+    // Strip all surface keys so disabled steps round-trip to the same
+    // YAML they had before the feature was toggled on.
+    const surfaceKeys = [
+      "detect_surface",
+      "surface_search_step",
+      "surface_force_threshold",
+      "surface_search_max_travel",
+    ];
+    onChange(Object.fromEntries(
+      Object.entries(options).filter(([key]) => !surfaceKeys.includes(key)),
+    ));
+  };
   return (
     <div style={methodOptionsStyle}>
       <div style={methodOptionsTitleStyle}>ASMI indentation options</div>
@@ -1134,6 +1186,44 @@ function MethodOptionsField({
           options={["false", "true"]}
           onChange={(v) => update("measure_with_return", v === "true")}
         />
+        <SmartSelectField
+          id={`${idPrefix}-detect-surface`}
+          name={`${namePrefix}_detect_surface`}
+          label="Detect surface"
+          value={String(detectSurface)}
+          options={["false", "true"]}
+          onChange={(v) => setDetectSurface(v === "true")}
+        />
+        {detectSurface && (
+          <>
+            <NumberField
+              id={`${idPrefix}-surface-search-step`}
+              name={`${namePrefix}_surface_search_step`}
+              label="Surface search step (mm)"
+              value={Number(options.surface_search_step ?? 0.5)}
+              onChange={(v) => update("surface_search_step", v)}
+            />
+            <NumberField
+              id={`${idPrefix}-surface-force-threshold`}
+              name={`${namePrefix}_surface_force_threshold`}
+              label="Surface force threshold (N)"
+              value={Number(options.surface_force_threshold ?? 0.01)}
+              onChange={(v) => update("surface_force_threshold", v)}
+            />
+            <NumberField
+              id={`${idPrefix}-surface-search-max-travel`}
+              name={`${namePrefix}_surface_search_max_travel`}
+              label="Surface search max travel (mm)"
+              value={Number(options.surface_search_max_travel ?? 10)}
+              onChange={(v) => update("surface_search_max_travel", v)}
+            />
+          </>
+        )}
+      </div>
+      <div style={methodOptionsHintStyle}>
+        {detectSurface
+          ? "Indentation limit height is measured from the detected surface (must be 0 or below)."
+          : "Enable Detect surface to configure the surface-search parameters."}
       </div>
     </div>
   );
@@ -1167,12 +1257,25 @@ const toolbarLabelStyle: React.CSSProperties = {
   ...theme.sectionLabel,
 };
 
+// Step args fill left-to-right in columns (same auto-fit pattern as the
+// ASMI indentation options) so a step card stays one or two rows tall
+// instead of stacking every parameter full-width.
+const stepArgsGridStyle: React.CSSProperties = {
+  display: "grid",
+  gridTemplateColumns: "repeat(auto-fit, minmax(160px, 1fr))",
+  gap: 8,
+  alignItems: "end",
+};
+
 const methodOptionsStyle: React.CSSProperties = {
   border: `1px solid ${theme.color.accentTintBorder}`,
   background: theme.color.accentTint,
   borderRadius: theme.radius.md,
   padding: 10,
   marginTop: 4,
+  // Spans the step-args grid so the tinted panel stays a full-width
+  // block below the main parameters.
+  gridColumn: "1 / -1",
 };
 
 const methodOptionsTitleStyle: React.CSSProperties = {
@@ -1186,6 +1289,12 @@ const methodOptionsGridStyle: React.CSSProperties = {
   display: "grid",
   gridTemplateColumns: "repeat(auto-fit, minmax(140px, 1fr))",
   gap: 8,
+};
+
+const methodOptionsHintStyle: React.CSSProperties = {
+  color: theme.color.accentText,
+  fontSize: 11,
+  marginTop: 8,
 };
 
 const namedPositionsStyle: React.CSSProperties = {

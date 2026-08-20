@@ -1,6 +1,8 @@
+import json
 import re
 import shutil
 import subprocess
+import tempfile
 from pathlib import Path
 import tomllib
 
@@ -9,6 +11,7 @@ import pytest
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 WINDOWS_INSTALLER = REPO_ROOT / "deploy" / "windows"
+DESKTOP_APP = REPO_ROOT / "apps" / "operator-desktop"
 
 
 def _extract_ini_section(text: str, section: str) -> str:
@@ -40,6 +43,15 @@ def test_windows_runtime_uses_venv_and_installs_core_and_api() -> None:
     assert "& $RuntimePython -m cubos_api" in start_cubos
 
 
+def test_windows_installer_requires_build_python_to_match_bundled_python() -> None:
+    build_script = (WINDOWS_INSTALLER / "build-installer.ps1").read_text()
+
+    assert "$BuildPythonVersion" in build_script
+    assert "$ExpectedPythonVersion" in build_script
+    assert "does not match bundled Python" in build_script
+    assert "-BuildPythonPath" in build_script
+
+
 def test_windows_runtime_install_reports_visible_progress() -> None:
     """The runtime install is a long, mostly-silent sequence of offline pip
     commands. Without incremental feedback it looks frozen, so Install-Runtime
@@ -66,7 +78,58 @@ def test_windows_runtime_install_reports_visible_progress() -> None:
     assert start_step_calls == 5  # 4 fixed phases + the one inside the driver loop
 
 
-def test_windows_installer_offers_asmi_as_optional_public_driver() -> None:
+def test_windows_runtime_uses_exit_code_side_channel_for_progress_processes() -> None:
+    install_runtime = (WINDOWS_INSTALLER / "scripts" / "Install-Runtime.ps1").read_text()
+
+    assert "$ExitCodeFile" in install_runtime
+    assert "[System.IO.File]::WriteAllText" in install_runtime
+    assert "[int]::TryParse" in install_runtime
+    assert "$Process.ExitCode" not in install_runtime
+
+
+def test_windows_installer_fails_when_runtime_setup_fails() -> None:
+    iss = (WINDOWS_INSTALLER / "CubOS.iss").read_text()
+    run_section = _extract_ini_section(iss, "Run")
+
+    assert "Install-Python.ps1" not in run_section
+    assert "Install-Runtime.ps1" not in run_section
+    assert "procedure CurStepChanged" in iss
+    assert "CurStep <> ssPostInstall" in iss
+    assert "Install-Python.ps1" in iss
+    assert "Install-Runtime.ps1" in iss
+    assert "ewWaitUntilTerminated" in iss
+    assert "if ResultCode <> 0 then" in iss
+    assert "RaiseException" in iss
+
+
+def test_windows_installer_packages_native_desktop_app() -> None:
+    iss = (WINDOWS_INSTALLER / "CubOS.iss").read_text()
+    build_script = (WINDOWS_INSTALLER / "build-installer.ps1").read_text()
+    workflow = (REPO_ROOT / ".github" / "workflows" / "windows-installer.yml").read_text()
+    run_section = _extract_ini_section(iss, "Run")
+    icons_section = _extract_ini_section(iss, "Icons")
+    desktop_package = json.loads((DESKTOP_APP / "package.json").read_text())
+
+    assert 'Source: "{#SourceDir}\\desktop\\*"' in iss
+    assert 'Filename: "{app}\\desktop\\CubOS.exe"' in run_section
+    assert "powershell.exe" not in run_section
+    assert 'Name: "{group}\\CubOS"; Filename: "{app}\\desktop\\CubOS.exe"' in icons_section
+    assert 'Name: "{autodesktop}\\CubOS"; Filename: "{app}\\desktop\\CubOS.exe"' in icons_section
+    desktop_task = next(
+        line for line in iss.splitlines() if 'Name: "desktopicon"' in line
+    )
+    assert "unchecked" not in desktop_task.lower()
+
+    assert '"apps\\operator-desktop"' in build_script
+    assert '"pack:win"' in build_script
+    assert '"dist\\win-unpacked"' in build_script
+    assert "apps/operator-desktop/**" in workflow
+    assert desktop_package["build"]["productName"] == "CubOS"
+    assert desktop_package["build"]["win"]["target"] == "dir"
+
+
+def test_windows_installer_installs_all_bundled_public_drivers_by_default() -> None:
+    """No per-driver checkbox; Install-Runtime.ps1 installs every driver file it finds."""
     iss = (WINDOWS_INSTALLER / "CubOS.iss").read_text()
     build_script = (WINDOWS_INSTALLER / "build-installer.ps1").read_text()
     install_runtime = (WINDOWS_INSTALLER / "scripts" / "Install-Runtime.ps1").read_text()
@@ -75,27 +138,58 @@ def test_windows_installer_offers_asmi_as_optional_public_driver() -> None:
         WINDOWS_INSTALLER / "requirements" / "drivers" / "asmi.txt"
     ).read_text()
 
-    assert "ASMI Go Direct driver support" in iss
-    asmi_task_line = next(line for line in iss.splitlines() if 'Name: "asmi"' in line)
-    assert "unchecked" not in asmi_task_line.lower()
-
-    # Inno Setup task hierarchy is positional: a task at indent level N becomes
-    # a child of the nearest preceding level-(N-1) task. Any backslash in a
-    # [Tasks] name would (re-)introduce accidental parenting like the ASMI
-    # default-selection bug this suite is guarding against.
     tasks_section = _extract_ini_section(iss, "Tasks")
     assert tasks_section
     task_names = re.findall(r'Name:\s*"([^"]+)"', tasks_section)
-    assert task_names
-    assert all("\\" not in name for name in task_names)
+    assert task_names == ["desktopicon"]
+    assert "asmi" not in iss.lower()
+    assert "GetDriverGroups" not in iss
+    assert "WizardIsTaskSelected" not in iss
+    assert "-DriverGroups" not in iss
 
-    assert "GetDriverGroups" in iss
-    assert "WizardIsTaskSelected('asmi')" in iss
+    assert "Get-ChildItem -Path $DriverRequirementsDir" in install_runtime
+    assert '-Filter "*.txt"' in install_runtime
+    assert "$SelectedDriverGroups" in install_runtime
     assert "godirect" not in runtime_requirements.lower()
     assert "godirect>=1.2.1" in asmi_requirements
     assert "$DriverRequirementsDir" in build_script
     assert "requirements\\drivers" in build_script
-    assert "$SelectedDriverGroups" in install_runtime
+
+    assert "TODO" in install_runtime
+    assert "uvvis" in install_runtime.lower()
+    assert "instruments/README.md" in install_runtime
+
+
+@pytest.mark.skipif(
+    shutil.which("pwsh") is None, reason="pwsh is not available on PATH"
+)
+def test_windows_runtime_installs_every_driver_requirements_file() -> None:
+    """Runs the real $SelectedDriverGroups snippet against a synthetic drivers directory."""
+    install_runtime = (WINDOWS_INSTALLER / "scripts" / "Install-Runtime.ps1").read_text()
+    match = re.search(r"\$SelectedDriverGroups = @\(.*?\n\)", install_runtime, re.DOTALL)
+    assert match, "could not find the $SelectedDriverGroups construction in Install-Runtime.ps1"
+    selection_snippet = match.group(0)
+
+    with tempfile.TemporaryDirectory() as tmp:
+        drivers_dir = Path(tmp) / "requirements" / "drivers"
+        drivers_dir.mkdir(parents=True)
+        (drivers_dir / "asmi.txt").write_text("godirect>=1.2.1\n")
+        (drivers_dir / "widgetcam.txt").write_text("widgetcam-sdk>=2.0\n")
+        (drivers_dir / "README.md").write_text("not a requirements file\n")
+
+        escaped_dir = str(drivers_dir).replace("'", "''")
+        probe = (
+            f"$DriverRequirementsDir = '{escaped_dir}'; "
+            f"{selection_snippet}; "
+            "$SelectedDriverGroups -join ','"
+        )
+        result = subprocess.run(
+            ["pwsh", "-NoProfile", "-NonInteractive", "-Command", probe],
+            capture_output=True,
+            text=True,
+        )
+        assert result.returncode == 0, result.stderr or result.stdout
+        assert result.stdout.strip() == "asmi,widgetcam"
 
 
 def _requirement_name(spec: str) -> str:
@@ -172,6 +266,14 @@ def test_windows_launcher_seeds_only_generic_config_templates() -> None:
         "sterling_deck",
     ):
         assert named_config not in start_cubos
+
+
+def test_windows_launcher_points_api_at_bundled_frontend() -> None:
+    start_cubos = (WINDOWS_INSTALLER / "scripts" / "Start-CubOS.ps1").read_text()
+
+    assert '$FrontendDist = Join-Path $CubOSDir "apps\\operator-web\\dist"' in start_cubos
+    assert '$env:CUBOS_WEB_DIR = Join-Path $CubOSDir "apps\\operator-web"' in start_cubos
+    assert "$env:CUBOS_WEB_DIST = $FrontendDist" in start_cubos
 
 
 @pytest.mark.skipif(

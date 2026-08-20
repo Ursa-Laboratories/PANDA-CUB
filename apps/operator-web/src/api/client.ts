@@ -4,6 +4,16 @@ export type SettingsResponse = {
   config_dir: string;
 };
 
+export type UpdateStatus = {
+  current_sha: string;
+  latest_sha: string;
+  commits_behind: number;
+  update_available: boolean;
+  checked_at: number;
+  summary: string[];
+  error: string | null;
+};
+
 class ApiError extends Error {
   status: number;
 
@@ -187,6 +197,10 @@ export const gantryApi = {
     request<import("../types").GantryPosition>("/gantry/reset-unlock", {
       method: "POST",
     }),
+  resume: () =>
+    request<import("../types").GantryPosition>("/gantry/resume", {
+      method: "POST",
+    }),
   feedHold: () =>
     request<import("../types").GantryPosition>("/gantry/feed-hold", {
       method: "POST",
@@ -260,6 +274,12 @@ export const runsApi = {
       body: JSON.stringify(body),
     }),
   get: (runId: string) => request<import("../types").RunRecord>(`/runs/${runId}`),
+  plan: (runId: string) =>
+    request<import("../types").RunPlanResponse>(`/runs/${runId}/plan`),
+  events: (runId: string, after = 0) =>
+    request<import("../types").RunEventsResponse>(
+      `/runs/${runId}/events?after=${after}`,
+    ),
   cancel: (runId: string) =>
     request<import("../types").RunRecord>(`/runs/${runId}/cancel`, {
       method: "POST",
@@ -314,6 +334,17 @@ export const settingsApi = {
     }),
 };
 
+export const systemApi = {
+  getUpdateStatus: (refresh = false) =>
+    request<UpdateStatus>(`/system/update${refresh ? "?refresh=true" : ""}`),
+  applyUpdate: () =>
+    request<{ status: string; target_sha: string }>("/system/update/apply", {
+      method: "POST",
+      body: JSON.stringify({}),
+    }),
+  health: () => request<{ status: string }>("/health"),
+};
+
 // Result data
 export const dataApi = {
   listCampaigns: () =>
@@ -322,4 +353,44 @@ export const dataApi = {
     download(`/data/campaigns/${campaignId}/measurements.zip`),
   exportCampaignAsmiZip: (campaignId: number) =>
     download(`/data/campaigns/${campaignId}/asmi.zip`),
+};
+
+// Manual instrument control (outside protocol runs)
+export type LightingInfo = {
+  instrument: string;
+  connected: boolean;
+  channels: Record<string, number[]>;
+  active: Record<string, number>;
+};
+
+export type CameraInfo = {
+  instrument: string;
+  vendor: string;
+  connected: boolean;
+  last_image: string | null;
+};
+
+export const instrumentsApi = {
+  listLighting: () => request<LightingInfo[]>("/instruments/lighting"),
+  setLights: (body: {
+    instrument: string;
+    channel?: string;
+    brightness?: number;
+    all_off?: boolean;
+  }) =>
+    request<LightingInfo>("/instruments/lighting/set", {
+      method: "POST",
+      body: JSON.stringify(body),
+    }),
+  listCameras: () => request<CameraInfo[]>("/instruments/camera"),
+  capture: (instrument: string, label?: string) =>
+    request<{ instrument: string; image_path: string }>(
+      "/instruments/camera/capture",
+      {
+        method: "POST",
+        body: JSON.stringify({ instrument, label }),
+      },
+    ),
+  lastImageUrl: (instrument: string) =>
+    `${BASE}/instruments/camera/last-image?instrument=${encodeURIComponent(instrument)}`,
 };

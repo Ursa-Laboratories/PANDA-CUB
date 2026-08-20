@@ -138,6 +138,66 @@ describe("GantryPositionWidget manual move safety", () => {
 
     expect(await screen.findByText(/Connection failed/)).toHaveTextContent("serial port unavailable");
     expect(screen.getByRole("button", { name: "Connect" })).toBeEnabled();
+    // A failed connect must not offer to home.
+    expect(screen.queryByRole("alertdialog")).not.toBeInTheDocument();
+  });
+
+  it("prompts to home after a successful connect and homes on accept", async () => {
+    const user = userEvent.setup();
+    const fetchMock = vi.fn(async () => jsonResponse({ status: "ok" }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    render(
+      <GantryPositionWidget
+        position={position({ connected: false })}
+        workingVolume={workingVolume}
+        gantryFile="cubos.yaml"
+        gantry={null}
+        onSaveCalibrated={async () => undefined}
+      />,
+    );
+
+    await user.click(screen.getByRole("button", { name: "Connect" }));
+
+    const dialog = await screen.findByRole("alertdialog", { name: "Gantry connected" });
+    expect(dialog).toHaveTextContent("Home the gantry now?");
+    expect(fetchMock).not.toHaveBeenCalledWith(
+      "/api/v1/gantry/home",
+      expect.objectContaining({ method: "POST" }),
+    );
+
+    await user.click(screen.getByRole("button", { name: "Home now" }));
+
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledWith(
+      "/api/v1/gantry/home",
+      expect.objectContaining({ method: "POST" }),
+    ));
+    expect(screen.queryByRole("alertdialog")).not.toBeInTheDocument();
+  });
+
+  it("does not home when the post-connect prompt is declined", async () => {
+    const user = userEvent.setup();
+    const fetchMock = vi.fn(async () => jsonResponse({ status: "ok" }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    render(
+      <GantryPositionWidget
+        position={position({ connected: false })}
+        workingVolume={workingVolume}
+        gantryFile="cubos.yaml"
+        gantry={null}
+        onSaveCalibrated={async () => undefined}
+      />,
+    );
+
+    await user.click(screen.getByRole("button", { name: "Connect" }));
+    await user.click(await screen.findByRole("button", { name: "Not now" }));
+
+    expect(screen.queryByRole("alertdialog")).not.toBeInTheDocument();
+    expect(fetchMock).not.toHaveBeenCalledWith(
+      "/api/v1/gantry/home",
+      expect.objectContaining({ method: "POST" }),
+    );
   });
 
   it("reads GRBL settings and displays them in numeric setting order", async () => {
@@ -230,6 +290,187 @@ describe("GantryPositionWidget manual move safety", () => {
     );
   });
 
+  it("offers Pull off limit after a jog and posts limit recovery", async () => {
+    const fetchMock = vi.fn(async () => jsonResponse({ status: "ok" }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    const widget = (pos: GantryPosition) => (
+      <GantryPositionWidget
+        position={pos}
+        workingVolume={workingVolume}
+        gantryFile="cubos.yaml"
+        gantry={null}
+        onSaveCalibrated={async () => undefined}
+      />
+    );
+    const { rerender } = render(widget(position()));
+
+    fireEvent.mouseDown(screen.getByTitle("X+"));
+    fireEvent.mouseUp(screen.getByTitle("X+"));
+
+    rerender(widget(position({ status: "ALARM:1" })));
+
+    fireEvent.click(screen.getByRole("button", { name: "Pull off limit" }));
+
+    await waitFor(() => {
+      expect(fetchMock).toHaveBeenCalledWith(
+        "/api/v1/gantry/calibration/recover-limit",
+        expect.objectContaining({
+          method: "POST",
+          body: JSON.stringify({ x: 0.5, y: 0, z: 0 }),
+        }),
+      );
+    });
+  });
+
+  it("hides Pull off limit when no jog direction is known", () => {
+    const fetchMock = vi.fn(async () => jsonResponse({ status: "ok" }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    render(
+      <GantryPositionWidget
+        position={position({ status: "ALARM:1" })}
+        workingVolume={workingVolume}
+        gantryFile="cubos.yaml"
+        gantry={null}
+        onSaveCalibrated={async () => undefined}
+      />,
+    );
+
+    expect(screen.queryByRole("button", { name: "Pull off limit" })).toBeNull();
+    expect(screen.getByRole("button", { name: "Unlock ($X)" })).toBeInTheDocument();
+  });
+
+  it("hides Pull off limit for non-limit alarms even with a known jog direction", () => {
+    const fetchMock = vi.fn(async () => jsonResponse({ status: "ok" }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    const widget = (pos: GantryPosition) => (
+      <GantryPositionWidget
+        position={pos}
+        workingVolume={workingVolume}
+        gantryFile="cubos.yaml"
+        gantry={null}
+        onSaveCalibrated={async () => undefined}
+      />
+    );
+    const { rerender } = render(widget(position()));
+
+    fireEvent.mouseDown(screen.getByTitle("X+"));
+    fireEvent.mouseUp(screen.getByTitle("X+"));
+
+    // ALARM:3 is abort-during-cycle (e-stop / reset) — the gantry is not on
+    // a limit switch, so an automatic 5 mm pull-off move must not be offered.
+    rerender(widget(position({ status: "ALARM:3" })));
+
+    expect(screen.queryByRole("button", { name: "Pull off limit" })).toBeNull();
+    expect(screen.getByRole("button", { name: "Unlock ($X)" })).toBeInTheDocument();
+  });
+
+  it("re-paces to the new segment on a direction change mid-hold", async () => {
+    vi.useFakeTimers();
+    const fetchMock = vi.fn<(input: string | URL | Request, init?: RequestInit) => Promise<Response>>(
+      async (input) => {
+        if (requestPath(input) === "/api/v1/gantry/jog-cancel") {
+          return jsonResponse(position());
+        }
+        return jsonResponse({ status: "ok" });
+      },
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    render(
+      <GantryPositionWidget
+        position={position()}
+        workingVolume={workingVolume}
+        gantryFile="cubos.yaml"
+        gantry={null}
+        onSaveCalibrated={async () => undefined}
+      />,
+    );
+
+    const jogBodies = () =>
+      fetchMock.mock.calls
+        .filter(([input]) => requestPath(input) === "/api/v1/gantry/jog")
+        .map(([, init]) => JSON.parse(String(init?.body)));
+
+    // Hold Z at the default 0.5 mm step (150 ms pace), then press X with a
+    // 20 mm step (480 ms pace) without releasing. The repeats must follow
+    // the 20 mm segment's pace — 20 mm jogs fired at the 0.5 mm cadence is
+    // exactly the backlog overrun this pacing exists to prevent.
+    fireEvent.change(screen.getByLabelText("XY mm"), { target: { value: "20" } });
+    fireEvent.mouseDown(screen.getByTitle("Z+"));
+
+    await vi.advanceTimersByTimeAsync(100);
+    expect(jogBodies()).toEqual([{ x: 0, y: 0, z: 0.5 }]);
+
+    fireEvent.mouseDown(screen.getByTitle("X+"));
+    await vi.advanceTimersByTimeAsync(10);
+    expect(jogBodies()).toEqual([
+      { x: 0, y: 0, z: 0.5 },
+      { x: 20, y: 0, z: 0 },
+    ]);
+
+    // Well past the old 150 ms cadence but before the 20 mm pace elapses:
+    // no further sends.
+    await vi.advanceTimersByTimeAsync(440);
+    expect(jogBodies()).toHaveLength(2);
+
+    // After the 20 mm pace (480 ms from its send) the next repeat fires.
+    await vi.advanceTimersByTimeAsync(100);
+    expect(jogBodies()).toHaveLength(3);
+
+    fireEvent.mouseUp(screen.getByTitle("X+"));
+    await vi.advanceTimersByTimeAsync(0);
+    expect(
+      fetchMock.mock.calls.some(([input]) => requestPath(input) === "/api/v1/gantry/jog-cancel"),
+    ).toBe(true);
+    vi.useRealTimers();
+  });
+
+  it("paces held jog repeats to the segment execution time", async () => {
+    vi.useFakeTimers();
+    const fetchMock = vi.fn(async (input: string | URL | Request) => {
+      if (requestPath(input) === "/api/v1/gantry/jog-cancel") {
+        return jsonResponse(position());
+      }
+      return jsonResponse({ status: "ok" });
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    render(
+      <GantryPositionWidget
+        position={position()}
+        workingVolume={workingVolume}
+        gantryFile="cubos.yaml"
+        gantry={null}
+        onSaveCalibrated={async () => undefined}
+      />,
+    );
+
+    const jogCalls = () =>
+      fetchMock.mock.calls.filter(([input]) => requestPath(input) === "/api/v1/gantry/jog");
+
+    // A 20 mm step at the 2000 mm/min jog feed takes 600 ms to execute, so
+    // held repeats pace to 0.8x that (480 ms), not the 150 ms UI tick —
+    // otherwise GRBL queues a backlog that keeps moving after release.
+    fireEvent.change(screen.getByLabelText("XY mm"), { target: { value: "20" } });
+    fireEvent.mouseDown(screen.getByTitle("X+"));
+
+    await vi.advanceTimersByTimeAsync(400);
+    expect(jogCalls()).toHaveLength(1);
+
+    await vi.advanceTimersByTimeAsync(200);
+    expect(jogCalls()).toHaveLength(2);
+
+    fireEvent.mouseUp(screen.getByTitle("X+"));
+    await vi.advanceTimersByTimeAsync(0);
+    expect(
+      fetchMock.mock.calls.some(([input]) => requestPath(input) === "/api/v1/gantry/jog-cancel"),
+    ).toBe(true);
+    vi.useRealTimers();
+  });
+
   it("runs advanced machine commands and shows success messages", async () => {
     const user = userEvent.setup();
     const fetchMock = vi.fn(async () => jsonResponse(position()));
@@ -259,9 +500,39 @@ describe("GantryPositionWidget manual move safety", () => {
     expect(await screen.findByText("Feed hold sent.")).toBeInTheDocument();
     expect(fetchMock).toHaveBeenCalledWith("/api/v1/gantry/feed-hold", expect.objectContaining({ method: "POST" }));
 
+    await user.click(screen.getByRole("button", { name: "Resume" }));
+    expect(await screen.findByText("Resume sent; verify Idle before homing.")).toBeInTheDocument();
+    expect(fetchMock).toHaveBeenCalledWith("/api/v1/gantry/resume", expect.objectContaining({ method: "POST" }));
+
     await user.click(screen.getByRole("button", { name: "Cancel Jog" }));
     expect(await screen.findByText("Jog cancel sent.")).toBeInTheDocument();
     expect(fetchMock).toHaveBeenCalledWith("/api/v1/gantry/jog-cancel", expect.objectContaining({ method: "POST" }));
+  });
+
+  it("blocks Home during feed hold and shows explicit recovery guidance", async () => {
+    const user = userEvent.setup();
+    const fetchMock = vi.fn(async () => jsonResponse(position({ status: "Idle" })));
+    vi.stubGlobal("fetch", fetchMock);
+
+    render(
+      <GantryPositionWidget
+        position={position({ status: "Hold:0" })}
+        workingVolume={workingVolume}
+        gantryFile="cubos.yaml"
+        gantry={null}
+        onSaveCalibrated={async () => undefined}
+      />,
+    );
+
+    expect(screen.getByRole("button", { name: "Home" })).toBeDisabled();
+    expect(screen.getByText(/Feed hold is active/)).toBeInTheDocument();
+
+    await user.click(screen.getByRole("button", { name: "Resume" }));
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/api/v1/gantry/resume",
+      expect.objectContaining({ method: "POST" }),
+    );
   });
 
   it("shows disconnect failures and returns the Disconnect button to ready state", async () => {
@@ -289,7 +560,6 @@ describe("GantryPositionWidget manual move safety", () => {
 
   it("confirms and sends home", async () => {
     const user = userEvent.setup();
-    const confirmSpy = vi.spyOn(window, "confirm").mockReturnValue(true);
     const fetchMock = vi.fn(async () =>
       jsonResponse(position({ x: 300, y: 200, z: 80 })),
     );
@@ -307,12 +577,47 @@ describe("GantryPositionWidget manual move safety", () => {
 
     await user.click(screen.getByRole("button", { name: "Home" }));
 
-    expect(confirmSpy).toHaveBeenCalledWith("Confirm you want to go to home?");
-    expect(fetchMock).toHaveBeenCalledWith(
+    // Homing is gated on the in-app confirm dialog (window.confirm is
+    // silently auto-dismissed in embedded browser panes).
+    const dialog = await screen.findByRole("alertdialog", { name: "Home gantry" });
+    expect(dialog).toHaveTextContent("Confirm you want to go to home?");
+    expect(fetchMock).not.toHaveBeenCalledWith(
       "/api/v1/gantry/home",
       expect.objectContaining({ method: "POST" }),
     );
-    confirmSpy.mockRestore();
+
+    await user.click(screen.getByRole("button", { name: "Go to home" }));
+
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledWith(
+      "/api/v1/gantry/home",
+      expect.objectContaining({ method: "POST" }),
+    ));
+    expect(screen.queryByRole("alertdialog")).not.toBeInTheDocument();
+  });
+
+  it("does not home when the confirm dialog is cancelled", async () => {
+    const user = userEvent.setup();
+    const fetchMock = vi.fn(async () => jsonResponse(position()));
+    vi.stubGlobal("fetch", fetchMock);
+
+    render(
+      <GantryPositionWidget
+        position={position()}
+        workingVolume={workingVolume}
+        gantryFile="cubos.yaml"
+        gantry={null}
+        onSaveCalibrated={async () => undefined}
+      />,
+    );
+
+    await user.click(screen.getByRole("button", { name: "Home" }));
+    await user.click(screen.getByRole("button", { name: "Cancel" }));
+
+    expect(screen.queryByRole("alertdialog")).not.toBeInTheDocument();
+    expect(fetchMock).not.toHaveBeenCalledWith(
+      "/api/v1/gantry/home",
+      expect.objectContaining({ method: "POST" }),
+    );
   });
 
   it("renders incoming move errors as dismissible command errors", async () => {
@@ -777,6 +1082,82 @@ describe("GantryPositionWidget manual move safety", () => {
     await waitFor(() => expect(fetchMock).toHaveBeenCalledWith(
       "/api/v1/gantry/calibration/restore-soft-limits",
       expect.objectContaining({ method: "POST" }),
+    ));
+  });
+
+  // Regression: Number("") is 0, so blank Move To fields used to pass the
+  // finite-number check and command a silent move to 0 on every blank axis
+  // (e.g. a Z plunge to deck level with only X filled in).
+  it("rejects a move when all coordinate fields are blank", async () => {
+    const user = userEvent.setup();
+    const fetchMock = vi.fn();
+    vi.stubGlobal("fetch", fetchMock);
+
+    render(
+      <GantryPositionWidget
+        position={position()}
+        workingVolume={workingVolume}
+        gantryFile="cubos.yaml"
+        gantry={null}
+        onSaveCalibrated={async () => undefined}
+      />,
+    );
+
+    await user.click(screen.getByRole("button", { name: "Go" }));
+
+    expect(await screen.findByText("Enter valid X, Y, and Z coordinates.")).toBeInTheDocument();
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("rejects a move when one axis is left blank instead of treating it as 0", async () => {
+    const user = userEvent.setup();
+    const fetchMock = vi.fn();
+    vi.stubGlobal("fetch", fetchMock);
+
+    render(
+      <GantryPositionWidget
+        position={position()}
+        workingVolume={workingVolume}
+        gantryFile="cubos.yaml"
+        gantry={null}
+        onSaveCalibrated={async () => undefined}
+      />,
+    );
+
+    await user.type(screen.getByLabelText("X (mm)"), "100");
+    await user.type(screen.getByLabelText("Y (mm)"), "100");
+    await user.click(screen.getByRole("button", { name: "Go" }));
+
+    expect(await screen.findByText("Enter valid X, Y, and Z coordinates.")).toBeInTheDocument();
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("still sends an explicit all-zero move", async () => {
+    const user = userEvent.setup();
+    const fetchMock = vi.fn(async () => jsonResponse({ status: "ok" }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    render(
+      <GantryPositionWidget
+        position={position()}
+        workingVolume={workingVolume}
+        gantryFile="cubos.yaml"
+        gantry={null}
+        onSaveCalibrated={async () => undefined}
+      />,
+    );
+
+    await user.type(screen.getByLabelText("X (mm)"), "0");
+    await user.type(screen.getByLabelText("Y (mm)"), "0");
+    await user.type(screen.getByLabelText("Z (mm)"), "0");
+    await user.click(screen.getByRole("button", { name: "Go" }));
+
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledWith(
+      "/api/v1/gantry/move-to",
+      expect.objectContaining({
+        method: "POST",
+        body: JSON.stringify({ x: 0, y: 0, z: 0 }),
+      }),
     ));
   });
 });

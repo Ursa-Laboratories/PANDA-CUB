@@ -28,6 +28,7 @@ EXPECTED_TYPES = [
     "camera",
     "capper",
     "filmetrics",
+    "lighting",
     "mounted_tool",
     "pipette",
     "potentiostat",
@@ -433,16 +434,19 @@ class TestGetSupportedVendors:
         assert get_supported_vendors("asmi") == ["vernier"]
 
     def test_camera_vendors(self):
-        assert get_supported_vendors("camera") == ["mount_only", "raspberry_pi"]
+        assert get_supported_vendors("camera") == ["flir", "mount_only", "opencv", "raspberry_pi"]
 
     def test_filmetrics_vendors(self):
         assert get_supported_vendors("filmetrics") == ["kla"]
+
+    def test_lighting_vendors(self):
+        assert get_supported_vendors("lighting") == ["pawduino"]
 
     def test_mounted_tool_vendors(self):
         assert get_supported_vendors("mounted_tool") == ["mount_only"]
 
     def test_pipette_vendors(self):
-        assert get_supported_vendors("pipette") == ["opentrons"]
+        assert get_supported_vendors("pipette") == ["opentrons", "sartorius"]
 
     def test_potentiostat_vendors(self):
         assert get_supported_vendors("potentiostat") == ["admiral"]

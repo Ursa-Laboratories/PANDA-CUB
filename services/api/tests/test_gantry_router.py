@@ -90,6 +90,10 @@ class FakeSession:
         self.calls.append(("home", None))
         return self.snapshot
 
+    def resume(self):
+        self.calls.append(("resume", None))
+        return self.snapshot
+
     def connect(self, path=None, *, filename=None):
         self.calls.append(("connect", (path, filename)))
         self.connected = True
@@ -677,7 +681,8 @@ def test_movement_reconnect_mapping_uses_structured_error_attribute(monkeypatch)
     ("method", "path", "session_method", "json_body"),
     [
         ("POST", "/api/v1/gantry/feed-hold", "feed_hold", None),
-        ("POST", "/api/v1/gantry/jog-cancel", "jog_cancel", None),
+        ("POST", "/api/v1/gantry/resume", "resume", None),
+        ("POST", "/api/v1/gantry/jog-cancel", "jog_cancel_interrupt", None),
         ("POST", "/api/v1/gantry/unlock", "unlock", None),
         ("POST", "/api/v1/gantry/reset-unlock", "reset_and_unlock", None),
         (
@@ -818,6 +823,31 @@ def test_calibration_and_recovery_endpoints_delegate_to_session(monkeypatch):
     assert "recover_calibration_limit" in called
 
 
+def test_limit_recovery_connection_loss_maps_to_503(monkeypatch):
+    from cubos.gantry.gantry_driver.exceptions import MillConnectionError
+
+    session = FakeSession()
+
+    def fail(**_kwargs):
+        raise MillConnectionError(
+            "Controller connection lost and serial reconnect failed after 4 attempts"
+        )
+
+    session.recover_calibration_limit = fail
+    monkeypatch.setattr(gantry_router, "_session", session)
+
+    response = api_request(
+        create_app(),
+        "POST",
+        "/api/v1/gantry/calibration/recover-limit",
+        json={"x": 1, "y": 0, "z": 0},
+    )
+
+    assert response.status_code == 503
+    assert "Controller connection lost" in response.text
+    assert "Power-cycle" in response.text
+
+
 def test_limit_recovery_alarm_error_maps_to_409(monkeypatch):
     session = FakeSession()
 
@@ -945,6 +975,7 @@ def test_advanced_gantry_actions_delegate_to_session(monkeypatch):
         ("POST", "/api/v1/gantry/unlock", None),
         ("POST", "/api/v1/gantry/reset-unlock", None),
         ("POST", "/api/v1/gantry/feed-hold", None),
+        ("POST", "/api/v1/gantry/resume", None),
         ("POST", "/api/v1/gantry/jog-cancel", None),
         ("GET", "/api/v1/gantry/grbl-settings", None),
         ("POST", "/api/v1/gantry/grbl-settings", {"setting": "$20", "value": "0"}),
@@ -958,7 +989,8 @@ def test_advanced_gantry_actions_delegate_to_session(monkeypatch):
     assert "unlock" in called
     assert "reset_and_unlock" in called
     assert "feed_hold" in called
-    assert "jog_cancel" in called
+    assert "resume" in called
+    assert "jog_cancel_interrupt" in called
     assert "read_grbl_settings" in called
     assert ("set_grbl_setting", ("$20", "0")) in session.calls
 

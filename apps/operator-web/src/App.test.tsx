@@ -23,6 +23,8 @@ type ApiState = {
   protocols: Record<string, ProtocolResponse>;
 };
 
+let lastSubmittedBody: Record<string, unknown> | null = null;
+
 type FetchMockOptions = {
   protocolRun?: (init?: RequestInit) => Promise<Response>;
   protocolCancel?: () => Response | Promise<Response>;
@@ -31,6 +33,11 @@ type FetchMockOptions = {
   calibrationWarning?: string | null;
   fluidStates?: FluidStateSummary[];
   runsSubmit?: (body: Record<string, unknown> | null) => Response | Promise<Response>;
+  runsGet?: (runId: string) => Response | Promise<Response>;
+  runsCancel?: (runId: string) => Response | Promise<Response>;
+  runPlan?: (runId: string) => Response | Promise<Response>;
+  runEvents?: (runId: string) => Response | Promise<Response>;
+  browse?: () => Response | Promise<Response>;
 };
 
 function createState(): ApiState {
@@ -50,7 +57,6 @@ function createState(): ApiState {
               length: 127.76,
               width: 85.47,
               height: 14.22,
-              a1: null,
               calibration: {
                 a1: { x: 10, y: 20, z: 30 },
                 a2: { x: 20, y: 20, z: 30 },
@@ -128,7 +134,7 @@ function toDeckResponse(filename: string, body: DeckConfig): DeckResponse {
 }
 
 function previewWells(config: WellPlateConfig): Record<string, WellPosition> {
-  const a1 = config.calibration.a1 ?? config.a1 ?? { x: 0, y: 0, z: 0 };
+  const a1 = config.calibration.a1 ?? { x: 0, y: 0, z: 0 };
   const wells: Record<string, WellPosition> = {};
   for (let row = 0; row < config.rows; row += 1) {
     const rowName = String.fromCharCode("A".charCodeAt(0) + row);
@@ -188,6 +194,7 @@ function installFetchMock(state: ApiState, options: FetchMockOptions = {}) {
       return jsonResponse({ config_dir: "/mock/CubOS/configs" });
     }
     if (path === "/api/v1/settings/browse" && method === "POST") {
+      if (options.browse) return options.browse();
       return jsonResponse({ config_dir: "/mock/CubOS/selected-configs" });
     }
     if (path === "/api/v1/settings" && method === "PUT") {
@@ -333,6 +340,7 @@ function installFetchMock(state: ApiState, options: FetchMockOptions = {}) {
     }
     if (path === "/api/v1/runs" && method === "POST") {
       if (options.runsSubmit) return options.runsSubmit(body);
+      lastSubmittedBody = body;
       lastSubmittedRunId = (body?.run_id as string) ?? null;
       lastSubmittedFluidStateId = (body?.state as { fluid_state_id?: number } | undefined)?.fluid_state_id
         ?? null;
@@ -351,8 +359,37 @@ function installFetchMock(state: ApiState, options: FetchMockOptions = {}) {
         fluid_state_id: lastSubmittedFluidStateId,
       });
     }
+    if (path.endsWith("/cancel") && path.startsWith("/api/v1/runs/") && method === "POST") {
+      const runId = path.slice("/api/v1/runs/".length, -"/cancel".length);
+      if (options.runsCancel) return options.runsCancel(runId);
+      return jsonResponse({
+        run_id: runId,
+        state: "cancel_requested",
+        created_at: 0,
+        started_at: 0,
+        finished_at: null,
+        mock_mode: false,
+        metadata: {},
+        digests: {},
+        result: null,
+        error: null,
+        artifacts: [],
+        fluid_state_id: null,
+      });
+    }
+    if (path.endsWith("/plan") && path.startsWith("/api/v1/runs/") && method === "GET") {
+      const runId = path.slice("/api/v1/runs/".length, -"/plan".length);
+      if (options.runPlan) return options.runPlan(runId);
+      return jsonResponse({ run_id: runId, steps: [] });
+    }
+    if (path.includes("/events") && path.startsWith("/api/v1/runs/") && method === "GET") {
+      const runId = path.slice("/api/v1/runs/".length).split("/")[0];
+      if (options.runEvents) return options.runEvents(runId);
+      return jsonResponse({ run_id: runId, events: [] });
+    }
     if (path.startsWith("/api/v1/runs/") && method === "GET") {
       const runId = path.slice("/api/v1/runs/".length);
+      if (options.runsGet) return options.runsGet(runId);
       return jsonResponse({
         run_id: runId,
         state: "succeeded",
@@ -439,6 +476,10 @@ async function connectGantry(user: ReturnType<typeof userEvent.setup>) {
   await screen.findByRole("button", { name: "Disconnect" });
 }
 
+async function returnToWorkflowTab(user: ReturnType<typeof userEvent.setup>) {
+  await user.click(screen.getByRole("button", { name: "Workflow" }));
+}
+
 describe("CubOS editor interactions", () => {
   beforeEach(() => {
     installFetchMock(createState());
@@ -466,6 +507,50 @@ describe("CubOS editor interactions", () => {
     await waitFor(() => expect(screen.getByDisplayValue("/mock/CubOS/selected-configs")).toBeInTheDocument());
   });
 
+  it("falls back to in-app path entry when the native picker cannot open", async () => {
+    const user = userEvent.setup();
+    installFetchMock(createState(), {
+      browse: () => new Response(
+        JSON.stringify({ detail: "Directory picker failed: no display" }),
+        { status: 400, headers: { "Content-Type": "application/json" } },
+      ),
+    });
+    renderApp();
+    await waitForSettingsLoad();
+
+    await user.click(screen.getByRole("button", { name: "Browse" }));
+
+    const dialog = await screen.findByRole("dialog", { name: "Select config directory" });
+    expect(dialog).toBeInTheDocument();
+    const pathInput = screen.getByLabelText("Config directory path");
+    // Prefilled with the current directory for editing in place.
+    expect(pathInput).toHaveValue("/mock/CubOS/configs");
+
+    await user.clear(pathInput);
+    await user.type(pathInput, "/mock/CubOS/typed-configs");
+    await user.click(screen.getByRole("button", { name: "Use Directory" }));
+
+    await waitFor(() => expect(screen.getByDisplayValue("/mock/CubOS/typed-configs")).toBeInTheDocument());
+    expect(screen.queryByRole("dialog", { name: "Select config directory" })).not.toBeInTheDocument();
+  });
+
+  it("keeps a cancelled native picker silent", async () => {
+    const user = userEvent.setup();
+    installFetchMock(createState(), {
+      browse: () => new Response(
+        JSON.stringify({ detail: "No directory selected" }),
+        { status: 400, headers: { "Content-Type": "application/json" } },
+      ),
+    });
+    renderApp();
+    await waitForSettingsLoad();
+
+    await user.click(screen.getByRole("button", { name: "Browse" }));
+
+    expect(screen.queryByRole("dialog", { name: "Select config directory" })).not.toBeInTheDocument();
+    expect(screen.getByDisplayValue("/mock/CubOS/configs")).toBeInTheDocument();
+  });
+
   it("clears loaded config selections when the config directory changes", async () => {
     const user = userEvent.setup();
     installFetchMock(createState());
@@ -487,7 +572,6 @@ describe("CubOS editor interactions", () => {
   it("guards dirty config-directory changes", async () => {
     const user = userEvent.setup();
     const fetchMock = installFetchMock(createState());
-    const confirmSpy = vi.spyOn(window, "confirm").mockReturnValue(false);
     renderApp();
     await waitForSettingsLoad();
 
@@ -499,17 +583,17 @@ describe("CubOS editor interactions", () => {
 
     await user.click(screen.getByRole("button", { name: "Browse" }));
 
-    await waitFor(() => expect(confirmSpy).toHaveBeenCalledWith(
+    expect(await screen.findByRole("alertdialog")).toHaveTextContent(
       "Discard unsaved config changes and switch config directory?",
-    ));
+    );
+    await user.click(screen.getByRole("button", { name: "Cancel" }));
+
     expect(screen.getByDisplayValue("/mock/CubOS/configs")).toBeInTheDocument();
     expect(screen.getByDisplayValue("Edited Plate")).toBeInTheDocument();
     expect(fetchMock).not.toHaveBeenCalledWith(
       "/api/v1/settings",
       expect.objectContaining({ method: "PUT" }),
     );
-
-    confirmSpy.mockRestore();
   });
 
   it("loads and saves a gantry config across tab switches", async () => {
@@ -548,7 +632,7 @@ describe("CubOS editor interactions", () => {
     await waitFor(() => expect(screen.getByDisplayValue("Renamed Plate")).toBeInTheDocument());
   });
 
-  it("imports a deck config into panda-deck.yaml", async () => {
+  it("imports a deck config into cub_deck.yaml", async () => {
     const user = userEvent.setup();
     const state = createState();
     installFetchMock(state);
@@ -559,9 +643,9 @@ describe("CubOS editor interactions", () => {
     await importConfig(user, "Import deck config", "deck.yaml");
 
     expect(await screen.findByDisplayValue("Deck Plate")).toBeInTheDocument();
-    await waitFor(() => expect(screen.getByPlaceholderText("panda-deck.yaml")).toBeInTheDocument());
+    await waitFor(() => expect(screen.getByPlaceholderText("cub_deck.yaml")).toBeInTheDocument());
     expect(
-      state.decks["panda-deck.yaml"]?.labware.map(({ key, config }) => ({ key, config })),
+      state.decks["cub_deck.yaml"]?.labware.map(({ key, config }) => ({ key, config })),
     ).toEqual(
       state.decks["deck.yaml"]?.labware.map(({ key, config }) => ({ key, config })),
     );
@@ -860,7 +944,7 @@ describe("CubOS editor interactions", () => {
         method: "POST",
         body: JSON.stringify({
           gantry_file: "cubos.yaml",
-          deck_file: "panda-deck.yaml",
+          deck_file: "cub_deck.yaml",
           protocol_file: "move.yaml",
         }),
       }),
@@ -971,8 +1055,8 @@ describe("CubOS editor interactions", () => {
     expect(runButton).toBeDisabled();
     await user.click(runButton);
     expect(fetchMock).not.toHaveBeenCalledWith(
-      "/api/v1/protocol/run",
-      expect.anything(),
+      "/api/v1/runs",
+      expect.objectContaining({ method: "POST" }),
     );
   });
 
@@ -997,7 +1081,10 @@ describe("CubOS editor interactions", () => {
     await waitFor(() => expect(runButton).toBeEnabled());
     await user.click(runButton);
     await waitFor(() =>
-      expect(fetchMock).toHaveBeenCalledWith("/api/v1/protocol/run", expect.anything()),
+      expect(fetchMock).toHaveBeenCalledWith(
+        "/api/v1/runs",
+        expect.objectContaining({ method: "POST" }),
+      ),
     );
   });
 
@@ -1026,7 +1113,10 @@ describe("CubOS editor interactions", () => {
     expect(await screen.findByText(/Unsaved changes/i)).toBeInTheDocument();
     await waitFor(() => expect(screen.getByRole("button", { name: "Run Protocol" })).toBeDisabled());
     await user.click(screen.getByRole("button", { name: "Run Protocol" }));
-    expect(fetchMock).not.toHaveBeenCalledWith("/api/v1/protocol/run", expect.anything());
+    expect(fetchMock).not.toHaveBeenCalledWith(
+      "/api/v1/runs",
+      expect.objectContaining({ method: "POST" }),
+    );
 
     // Saving clears the dirty state and re-enables running.
     await user.click(screen.getByRole("button", { name: "Save" }));
@@ -1038,26 +1128,37 @@ describe("CubOS editor interactions", () => {
     await user.click(runAfterSave);
 
     await waitFor(() => expect(fetchMock).toHaveBeenCalledWith(
-      "/api/v1/protocol/run",
-      expect.objectContaining({
-        method: "POST",
-        body: JSON.stringify({
-          gantry_file: "cubos.yaml",
-          deck_file: "panda-deck.yaml",
-          protocol_file: "move.yaml",
-        }),
-      }),
+      "/api/v1/runs",
+      expect.objectContaining({ method: "POST" }),
     ));
-    expect(await screen.findByText(/campaign #123 created/i)).toBeInTheDocument();
-    expect(screen.getByLabelText("Last Campaign")).toHaveValue("#123");
+    // run_id is generated per submission, so assert the config selection
+    // rather than an exact body string.
+    expect(lastSubmittedBody).toMatchObject({
+      gantry_file: "cubos.yaml",
+      deck_file: "cub_deck.yaml",
+      protocol_file: "move.yaml",
+    });
+    await returnToWorkflowTab(user);
+    expect(await screen.findByText(/campaign #456 created/i)).toBeInTheDocument();
+    expect(screen.getByLabelText("Last Campaign")).toHaveValue("#456");
   });
 
   it("surfaces protocol run failures and re-enables Run Protocol", async () => {
     const user = userEvent.setup();
     installFetchMock(createState(), {
-      protocolRun: async () => new Response("Gantry lost connection", {
-        status: 500,
-        statusText: "Internal Server Error",
+      runsGet: (runId: string) => jsonResponse({
+        run_id: runId,
+        state: "failed",
+        created_at: 0,
+        started_at: 0,
+        finished_at: 1,
+        mock_mode: false,
+        metadata: {},
+        digests: {},
+        result: null,
+        error: "Gantry lost connection",
+        artifacts: [],
+        fluid_state_id: null,
       }),
     });
 
@@ -1070,24 +1171,36 @@ describe("CubOS editor interactions", () => {
     await importConfig(user, "Import protocol config", "move.yaml");
     await user.click(await screen.findByRole("button", { name: "Run Protocol" }));
 
-    expect(await screen.findByText("Gantry lost connection")).toBeInTheDocument();
+    // The Run view reports the failure where the operator already is.
+    expect(await screen.findByRole("alert")).toHaveTextContent("Gantry lost connection");
+    await returnToWorkflowTab(user);
+    expect(await screen.findAllByText("Gantry lost connection")).not.toHaveLength(0);
     await waitFor(() => expect(screen.getByRole("button", { name: "Run Protocol" })).toBeEnabled());
     expect(screen.queryByRole("button", { name: "Running..." })).not.toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "Cancelling..." })).not.toBeInTheDocument();
   });
 
-  it("keeps the run pending after cancel until the protocol request settles", async () => {
+  it("keeps the run pending after cancel until the run reaches a terminal state", async () => {
     const user = userEvent.setup();
-    let resolveRun!: (response: Response) => void;
-    let runSignal: AbortSignal | undefined;
+    // The run stays "running" until the test flips it, mirroring a gantry
+    // that has acknowledged the cancel but not yet stopped.
+    let runState = "running";
     const fetchMock = installFetchMock(createState(), {
-      protocolRun: (init?: RequestInit) => new Promise<Response>((resolve) => {
-        runSignal = init?.signal ?? undefined;
-        resolveRun = resolve;
-      }),
-      protocolCancel: () => jsonResponse({
-        status: "cancel_requested",
-        warning: "sent but not acknowledged",
+      runsGet: (runId: string) => jsonResponse({
+        run_id: runId,
+        state: runState,
+        created_at: 0,
+        started_at: 0,
+        finished_at: runState === "running" ? null : 1,
+        mock_mode: false,
+        metadata: {},
+        digests: {},
+        result: runState === "succeeded"
+          ? { status: "ok", steps_executed: 1, campaign_id: 456 }
+          : null,
+        error: null,
+        artifacts: [],
+        fluid_state_id: null,
       }),
     });
     renderApp();
@@ -1099,25 +1212,89 @@ describe("CubOS editor interactions", () => {
     await importConfig(user, "Import protocol config", "move.yaml");
     await user.click(await screen.findByRole("button", { name: "Run Protocol" }));
 
+    await returnToWorkflowTab(user);
     expect(await screen.findByRole("button", { name: "Running..." })).toBeDisabled();
     const cancelButton = await screen.findByRole("button", { name: "Cancel Run" });
     expect(cancelButton).toBeEnabled();
 
     await user.click(cancelButton);
 
+    // An addressable run cancels through its own resource, not the legacy
+    // whole-session endpoint.
     await waitFor(() => expect(fetchMock).toHaveBeenCalledWith(
-      "/api/v1/protocol/cancel",
+      expect.stringMatching(/^\/api\/v1\/runs\/.+\/cancel$/),
       expect.objectContaining({ method: "POST" }),
     ));
-    expect(runSignal).toBeUndefined();
-    expect(await screen.findAllByText(/sent but not acknowledged/i)).not.toHaveLength(0);
+    expect(await screen.findAllByText(/cancellation requested/i)).not.toHaveLength(0);
     expect(screen.getAllByRole("button", { name: "Cancelling..." }).every((button) => button.hasAttribute("disabled"))).toBe(true);
     expect(screen.getByRole("button", { name: "Cancelling — waiting for protocol to stop" })).toBeDisabled();
 
-    resolveRun(jsonResponse({ status: "complete", steps_executed: 1, campaign_id: 123 }));
+    runState = "succeeded";
 
-    expect(await screen.findByText(/campaign #123 created/i)).toBeInTheDocument();
+    expect(await screen.findByText(/campaign #456 created/i)).toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "Cancelling — waiting for protocol to stop" })).not.toBeInTheDocument();
+  });
+
+  it("enters a Run view on submit, and keeps it reachable afterwards", async () => {
+    const user = userEvent.setup();
+    installFetchMock(createState(), {
+      runPlan: (runId: string) => jsonResponse({
+        run_id: runId,
+        steps: [
+          { index: 0, command: "home", summary: "all axes", args: {} },
+          { index: 1, command: "move", summary: "pipette → plate_1.A1", args: {} },
+        ],
+      }),
+    });
+    renderApp();
+    await waitForSettingsLoad();
+    await loadRequiredProtocolDependencies(user);
+    await connectGantry(user);
+
+    await user.click(screen.getByRole("button", { name: "Protocol" }));
+    await importConfig(user, "Import protocol config", "move.yaml");
+
+    // No run yet: an empty Run view would be a dead tab.
+    expect(screen.queryByRole("button", { name: "Run" })).toBeNull();
+
+    await user.click(await screen.findByRole("button", { name: "Run Protocol" }));
+
+    // Submitting switches into the run mode and shows the compiled steps
+    // alongside the live gantry readout.
+    const runRegion = await screen.findByRole("region", { name: "Run progress" });
+    expect(runRegion).toBeInTheDocument();
+    expect(await screen.findByText("all axes")).toBeInTheDocument();
+    expect(screen.getByText("pipette → plate_1.A1")).toBeInTheDocument();
+
+    // Navigating away and back returns to the same run.
+    await user.click(screen.getByRole("button", { name: "State" }));
+    expect(screen.queryByRole("region", { name: "Run progress" })).toBeNull();
+    await user.click(screen.getByRole("button", { name: "Run" }));
+    expect(await screen.findByRole("region", { name: "Run progress" })).toBeInTheDocument();
+  });
+
+  it("reports the run outcome inside the Run view", async () => {
+    const user = userEvent.setup();
+    installFetchMock(createState(), {
+      runPlan: (runId: string) => jsonResponse({
+        run_id: runId,
+        steps: [{ index: 0, command: "home", summary: "all axes", args: {} }],
+      }),
+    });
+    renderApp();
+    await waitForSettingsLoad();
+    await loadRequiredProtocolDependencies(user);
+    await connectGantry(user);
+
+    await user.click(screen.getByRole("button", { name: "Protocol" }));
+    await importConfig(user, "Import protocol config", "move.yaml");
+    await user.click(await screen.findByRole("button", { name: "Run Protocol" }));
+
+    // The operator stays in the Run view when it finishes, so the outcome
+    // has to be reported there and not only in the workflow footer.
+    expect(
+      await screen.findByText(/campaign #456 created/i),
+    ).toBeInTheDocument();
   });
 
   it("shows a protocol-running sidebar banner outside the Protocol tab", async () => {
@@ -1165,7 +1342,10 @@ describe("CubOS editor interactions", () => {
     expect(banner).toHaveTextContent("Deck");
     await waitFor(() => expect(screen.getByRole("button", { name: "Run Protocol" })).toBeDisabled());
     await user.click(screen.getByRole("button", { name: "Run Protocol" }));
-    expect(fetchMock).not.toHaveBeenCalledWith("/api/v1/protocol/run", expect.anything());
+    expect(fetchMock).not.toHaveBeenCalledWith(
+      "/api/v1/runs",
+      expect.objectContaining({ method: "POST" }),
+    );
   });
 
   it("prompts to save deck edits in the Deck tab", async () => {
@@ -1263,18 +1443,15 @@ describe("CubOS editor interactions", () => {
     await user.type(nameField, "Edited Plate");
 
     // Cancelling the confirm keeps the edits and the current file.
-    const confirmSpy = vi.spyOn(window, "confirm").mockReturnValueOnce(false);
     await importConfig(user, "Import deck config", "deck2.yaml");
-    expect(confirmSpy).toHaveBeenCalled();
-    expect(confirmSpy.mock.calls[0][0]).toContain("panda-deck.yaml");
+    expect(await screen.findByRole("alertdialog")).toHaveTextContent("cub_deck.yaml");
+    await user.click(screen.getByRole("button", { name: "Cancel" }));
     expect(screen.getByDisplayValue("Edited Plate")).toBeInTheDocument();
 
     // Confirming discards the edit and switches to the newly imported file.
-    confirmSpy.mockReturnValueOnce(true);
     await importConfig(user, "Import deck config", "deck2.yaml");
+    await user.click(await screen.findByRole("button", { name: "Discard" }));
     expect(await screen.findByDisplayValue("Second Deck Plate")).toBeInTheDocument();
-
-    confirmSpy.mockRestore();
   });
 
   it("guards discarding unsaved gantry edits when switching the imported file", async () => {
@@ -1295,17 +1472,15 @@ describe("CubOS editor interactions", () => {
     // Cancelling the confirm keeps the edits and the current file. (The
     // field now shows a per-field amber "*" since it differs from the
     // saved baseline, so match loosely.)
-    const confirmSpy = vi.spyOn(window, "confirm").mockReturnValueOnce(false);
     await importConfig(user, "Import gantry config", "cubos2.yaml");
-    expect(confirmSpy).toHaveBeenCalled();
+    expect(await screen.findByRole("alertdialog")).toHaveTextContent("Discard unsaved gantry changes?");
+    await user.click(screen.getByRole("button", { name: "Cancel" }));
     expect(screen.getByLabelText(/^Serial port/)).toHaveValue("-edited");
 
     // Confirming discards the edit and switches to the newly imported file.
-    confirmSpy.mockReturnValueOnce(true);
     await importConfig(user, "Import gantry config", "cubos2.yaml");
+    await user.click(await screen.findByRole("button", { name: "Discard" }));
     await waitFor(() => expect(screen.getByLabelText("Serial port")).toHaveValue("/dev/ttyUSB-second"));
-
-    confirmSpy.mockRestore();
   });
 
   it("guards discarding unsaved protocol edits when switching the imported file", async () => {
@@ -1328,17 +1503,15 @@ describe("CubOS editor interactions", () => {
     await user.type(travelZField, "77");
 
     // Cancelling the confirm keeps the edits and the current file.
-    const confirmSpy = vi.spyOn(window, "confirm").mockReturnValueOnce(false);
     await importConfig(user, "Import protocol config", "move2.yaml");
-    expect(confirmSpy).toHaveBeenCalled();
+    expect(await screen.findByRole("alertdialog")).toHaveTextContent("Discard unsaved protocol changes?");
+    await user.click(screen.getByRole("button", { name: "Cancel" }));
     expect(screen.getByLabelText("Travel Z")).toHaveValue("77");
 
     // Confirming discards the edit and switches to the newly imported file.
-    confirmSpy.mockReturnValueOnce(true);
     await importConfig(user, "Import protocol config", "move2.yaml");
+    await user.click(await screen.findByRole("button", { name: "Discard" }));
     await waitFor(() => expect(screen.getByLabelText("Travel Z")).toHaveValue("9"));
-
-    confirmSpy.mockRestore();
   });
 
   it("guards page unload while any editor has unsaved edits", async () => {
@@ -1436,14 +1609,18 @@ describe("CubOS editor interactions", () => {
     const [, submitInit] = fetchMock.mock.calls.find(([input]) => input === "/api/v1/runs")!;
     expect(JSON.parse(String(submitInit?.body))).toMatchObject({
       gantry_file: "cubos.yaml",
-      deck_file: "panda-deck.yaml",
+      deck_file: "cub_deck.yaml",
       protocol_file: "move.yaml",
       state: { fluid_state_id: 5 },
     });
 
+    await returnToWorkflowTab(user);
     expect(await screen.findByText(/campaign #456 created/i)).toBeInTheDocument();
-    // The legacy synchronous endpoint must never be used for a stateful run.
-    expect(fetchMock).not.toHaveBeenCalledWith("/api/v1/protocol/run", expect.anything());
+    // The legacy synchronous endpoint is no longer used by the UI at all.
+    expect(fetchMock).not.toHaveBeenCalledWith(
+      "/api/v1/protocol/run",
+      expect.anything(),
+    );
   });
 
   it("surfaces a deck-fingerprint mismatch error clearly when resuming", async () => {
@@ -1478,6 +1655,7 @@ describe("CubOS editor interactions", () => {
     await user.selectOptions(screen.getByLabelText("Fluid state to resume"), "5");
     await user.click(await screen.findByRole("button", { name: "Run Protocol" }));
 
+    await user.click(screen.getByRole("button", { name: "Workflow" }));
     expect(await screen.findByText(/deck fingerprint/i)).toBeInTheDocument();
   });
 
@@ -1511,7 +1689,7 @@ describe("CubOS editor interactions", () => {
     ));
     const [, submitInit] = fetchMock.mock.calls.find(([input]) => input === "/api/v1/runs")!;
     expect(JSON.parse(String(submitInit?.body))).toMatchObject({
-      deck_file: "panda-deck.yaml",
+      deck_file: "cub_deck.yaml",
       protocol_file: "move.yaml",
       state: {
         initial_state: {

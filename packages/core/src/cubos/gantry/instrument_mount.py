@@ -5,6 +5,7 @@ import math
 from typing import Any, TYPE_CHECKING
 
 from cubos.instruments.base_instrument import BaseInstrument
+from cubos.instruments.lighting.interface import LightingInstrument
 
 if TYPE_CHECKING:
     from cubos.gantry import Gantry
@@ -148,7 +149,19 @@ class InstrumentedGantry:
             instrument.connect()
 
     def disconnect_instruments(self) -> None:
-        """Disconnect all instruments, logging errors without re-raising."""
+        """Disconnect all instruments, logging errors without re-raising.
+
+        Lighting is commanded off first, best-effort, so an aborted run
+        never leaves lights on.
+        """
+        for name, instrument in self.instruments.items():
+            if isinstance(instrument, LightingInstrument):
+                try:
+                    instrument.all_off()
+                except Exception:
+                    self.logger.exception(
+                        "Failed to turn off lighting instrument '%s'", name,
+                    )
         for name, instrument in self.instruments.items():
             try:
                 self.logger.info("Disconnecting instrument: %s", name)
