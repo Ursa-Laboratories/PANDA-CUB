@@ -12,7 +12,18 @@ from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 
 from cubos_api.config import get_settings
-from cubos_api.routers import data, deck, gantry, protocol, raw, runs, settings, system
+from cubos_api.routers import (
+    data,
+    deck,
+    fluid_states,
+    gantry,
+    instruments,
+    protocol,
+    raw,
+    runs,
+    settings,
+    system,
+)
 
 FRONTEND_DIST = Path(
     os.environ.get(
@@ -21,6 +32,21 @@ FRONTEND_DIST = Path(
     )
 )
 logger = logging.getLogger(__name__)
+
+
+class FrontendStaticFiles(StaticFiles):
+    """Serve the operator UI with revalidation forced for the entry page.
+
+    Asset filenames are content-hashed, so browsers may cache them freely,
+    but index.html must be revalidated on every load — otherwise a cached
+    entry page keeps referencing asset hashes that an in-app update deleted.
+    """
+
+    def file_response(self, full_path, stat_result, scope, status_code=200):
+        response = super().file_response(full_path, stat_result, scope, status_code)
+        if Path(full_path).name == "index.html":
+            response.headers["Cache-Control"] = "no-cache"
+        return response
 
 # Methods that change server state — these are the ones a malicious page can
 # trigger cross-origin (CSRF) and that DNS-rebinding could redirect to CubOS.
@@ -104,6 +130,7 @@ async def lifespan(app: FastAPI):
             session.disconnect()
         except Exception as e:
             logger.warning("Error disconnecting gantry on shutdown: %s", e)
+        instruments.reset_manual_instruments()
         gantry.reset_session()
 
 
@@ -113,13 +140,17 @@ def create_app() -> FastAPI:
     app.include_router(deck.router)
     app.include_router(data.router)
     app.include_router(gantry.router)
+    app.include_router(instruments.router)
     app.include_router(protocol.router)
     app.include_router(raw.router)
     app.include_router(settings.router)
     app.include_router(system.router)
     app.include_router(runs.router)
+    app.include_router(fluid_states.router)
 
     if FRONTEND_DIST.is_dir():
-        app.mount("/", StaticFiles(directory=FRONTEND_DIST, html=True), name="frontend")
+        app.mount(
+            "/", FrontendStaticFiles(directory=FRONTEND_DIST, html=True), name="frontend"
+        )
 
     return app

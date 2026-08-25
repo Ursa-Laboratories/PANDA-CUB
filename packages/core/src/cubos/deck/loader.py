@@ -448,6 +448,11 @@ def _build_vial_grid(
             location=coordinate,
             capacity_ul=entry.capacity_ul,
             working_volume_ul=entry.working_volume_ul,
+            dead_volume_ul=entry.vial_dead_volume_ul,
+            role=entry.vial_role,
+            solution=entry.vial_solution,
+            allowed_solutions=entry.vial_allowed_solutions,
+            capped=entry.vial_capped,
         )
         for position_id, coordinate in positions.items()
     }
@@ -524,6 +529,11 @@ def _build_nested_vial(
         ),
         capacity_ul=entry.capacity_ul,
         working_volume_ul=entry.working_volume_ul,
+        dead_volume_ul=entry.dead_volume_ul,
+        role=entry.role,
+        solution=entry.solution,
+        allowed_solutions=entry.allowed_solutions,
+        capped=entry.capped,
     )
 
 
@@ -540,6 +550,7 @@ def _build_nested_well_plate(
         width=entry.width,
         height=entry.height,
         well_depth=entry.well_depth,
+        well_attributes=entry.well_attributes,
         rows=entry.rows,
         columns=entry.columns,
         wells=_derive_wells_from_calibration(entry, resolved_z=resolved_z),

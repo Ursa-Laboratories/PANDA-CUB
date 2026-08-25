@@ -21,10 +21,13 @@ from typing import Any
 
 from cubos.gantry.instrument_mount import InstrumentedGantry
 from cubos.deck.deck import Deck
+from cubos.deck.labware.container_role import STOCK, WASTE
 from cubos.deck.labware.tip_rack import (
     TipRackResolutionError,
     resolve_tip_rack_slot,
 )
+from cubos.deck.labware.vial import Vial
+from cubos.deck.labware.vial_grid import VialGrid
 from cubos.deck.labware.well_plate import WellPlate
 from cubos.gantry.gantry_config import GantryConfig
 from cubos.gantry.machine_geometry import FixedStructureBox, fixed_structures_for_gantry
@@ -33,6 +36,7 @@ from cubos.protocol_engine.registry import CommandRegistry
 from cubos.protocol_engine.scan_args import (
     NormalizedScanArguments,
     normalize_scan_arguments,
+    surface_detection_enabled,
 )
 
 from .errors import ProtocolSemanticViolation
@@ -774,21 +778,57 @@ def _validate_scan_command(
         instrumented_gantry=instrumented_gantry,
         gantry=gantry,
     ))
-    indentation_limit_height = args.get("indentation_limit_height")
+    violations.extend(_indentation_limit_frame_violations(
+        step_index=step_index,
+        command_name="scan",
+        indentation_limit_height=args.get("indentation_limit_height"),
+        relative_action=relative_action,
+        method_kwargs=normalized.method_kwargs,
+    ))
+    return violations
+
+
+def _indentation_limit_frame_violations(
+    *,
+    step_index: int,
+    command_name: str,
+    indentation_limit_height: Any,
+    relative_action: float,
+    method_kwargs: dict[str, Any],
+) -> list[ProtocolSemanticViolation]:
+    """Check ``indentation_limit_height`` against its anchoring frame.
+
+    Without surface detection the limit shares the calibrated-well frame
+    with ``measurement_height`` and must sit at or below it. With
+    ``detect_surface`` the limit is anchored to the sensor-detected sample
+    surface — comparing it to ``measurement_height`` would be a frame
+    mismatch — and must instead be at or below zero.
+    """
     if (
-        indentation_limit_height is not None
-        and isinstance(indentation_limit_height, (int, float))
-        and not isinstance(indentation_limit_height, bool)
-        and math.isfinite(float(indentation_limit_height))
-        and indentation_limit_height > relative_action
+        indentation_limit_height is None
+        or not isinstance(indentation_limit_height, (int, float))
+        or isinstance(indentation_limit_height, bool)
+        or not math.isfinite(float(indentation_limit_height))
     ):
-        violations.append(_violation(
-            step_index, "scan",
+        return []
+    if surface_detection_enabled(method_kwargs):
+        if indentation_limit_height > 0:
+            return [_violation(
+                step_index, command_name,
+                f"indentation_limit_height ({indentation_limit_height}) must "
+                "be at or below 0 when detect_surface is enabled — it is "
+                "anchored to the detected sample surface (negative = into "
+                "the sample).",
+            )]
+        return []
+    if indentation_limit_height > relative_action:
+        return [_violation(
+            step_index, command_name,
             f"indentation_limit_height ({indentation_limit_height}) is above "
             f"measurement_height ({relative_action}). The deepest descent "
             "plane must be at or below the action plane in +Z-up.",
-        ))
-    return violations
+        )]
+    return []
 
 
 def _validate_measure_command(
@@ -917,20 +957,13 @@ def _validate_measure_command(
         instrumented_gantry=instrumented_gantry,
         gantry=gantry,
     ))
-    indentation_limit_height = args.get("indentation_limit_height")
-    if (
-        indentation_limit_height is not None
-        and isinstance(indentation_limit_height, (int, float))
-        and not isinstance(indentation_limit_height, bool)
-        and math.isfinite(float(indentation_limit_height))
-        and indentation_limit_height > relative_action
-    ):
-        violations.append(_violation(
-            step_index, "measure",
-            f"indentation_limit_height ({indentation_limit_height}) is above "
-            f"measurement_height ({relative_action}). The deepest descent "
-            "plane must be at or below the action plane in +Z-up.",
-        ))
+    violations.extend(_indentation_limit_frame_violations(
+        step_index=step_index,
+        command_name="measure",
+        indentation_limit_height=args.get("indentation_limit_height"),
+        relative_action=relative_action,
+        method_kwargs=normalized.method_kwargs,
+    ))
     return violations
 
 
@@ -1147,13 +1180,150 @@ def _require_attached_tip(
 _PIPETTE_COMMANDS = frozenset({
     "aspirate",
     "blowout",
+    "clear_well",
     "drop_tip",
+    "flush_pipette",
     "mix",
     "pick_up_tip",
+    "purge_pipette",
+    "rinse_well",
     "transfer",
     "serial_transfer",
 })
 _NO_MOTION_COMMANDS = frozenset({"pause", "breakpoint"})
+
+
+# -- Feature 05: compound-command container resolution (structural only) --
+#
+# Automatic selection (`solution=`/role-based, see
+# `cubos.protocol_engine.commands._liquid_selection`) picks its concrete
+# container from *tracked volumes*, which this static pass has no access to.
+# What IS checkable here, with only the deck definition (no initial-fluids
+# seed required): whether the requested role/solution combination is even
+# defined on the deck at all -- catching a typo'd solution name or a deck
+# with no waste container long before a hardware run. Full volume-adequate
+# selection (dead-volume reserve, waste headroom) is separately simulated
+# offline when an initial-fluids seed is supplied -- see
+# `cubos.validation.fluid_volumes`. Neither pass feeds the resolved
+# automatic-selection container back into this module's XY/Z/structure
+# bounds checks below (`_validate_pipette_engage`); only explicit
+# source/waste/well positions get full motion-bounds coverage. This is a
+# deliberate, documented scope gap (see docs/protocol-yaml.md).
+
+
+def _iter_role_vials(deck: Deck, role: str):
+    for labware in deck.volume_labware.values():
+        if isinstance(labware, Vial):
+            if labware.role == role:
+                yield labware
+        elif isinstance(labware, VialGrid):
+            for vial in labware.vials.values():
+                if vial.role == role:
+                    yield vial
+
+
+def _static_stock_candidate_exists(deck: Deck, solution: str) -> bool:
+    return any(
+        vial.solution == solution for vial in _iter_role_vials(deck, STOCK)
+    )
+
+
+def _static_waste_candidate_exists(deck: Deck, solution: Any) -> bool:
+    for vial in _iter_role_vials(deck, WASTE):
+        if vial.allowed_solutions is None:
+            return True
+        if solution is not None and solution in vial.allowed_solutions:
+            return True
+    return False
+
+
+def _validate_stock_or_solution(
+    *,
+    step_index: int,
+    command_name: str,
+    label: str,
+    deck: Deck,
+    source: Any,
+    solution: Any,
+) -> list[ProtocolSemanticViolation]:
+    if (source is None) == (solution is None):
+        return [_violation(
+            step_index,
+            command_name,
+            f"{label}: provide exactly one of an explicit source or "
+            "`solution=` for automatic stock selection.",
+        )]
+    if (
+        solution is not None
+        and isinstance(solution, str)
+        and not _static_stock_candidate_exists(deck, solution)
+    ):
+        return [_violation(
+            step_index,
+            command_name,
+            f"{label}: no role={STOCK!r} container with solution={solution!r} "
+            "is defined on the deck.",
+        )]
+    return []
+
+
+def _validate_waste_or_solution(
+    *,
+    step_index: int,
+    command_name: str,
+    label: str,
+    deck: Deck,
+    waste: Any,
+    solution: Any,
+) -> list[ProtocolSemanticViolation]:
+    if waste is not None:
+        return []
+    if not _static_waste_candidate_exists(deck, solution):
+        detail = f" accepting solution={solution!r}" if solution else ""
+        return [_violation(
+            step_index,
+            command_name,
+            f"{label}: no role={WASTE!r} container{detail} is defined on "
+            "the deck.",
+        )]
+    return []
+
+
+def _validate_optional_engage(
+    *,
+    step_index: int,
+    command_name: str,
+    label: str,
+    position: Any,
+    args: dict[str, Any],
+    height_field_name: str,
+    tip_extension: float,
+    instrumented_gantry: InstrumentedGantry,
+    deck: Deck,
+    gantry: GantryConfig,
+    current_poses: dict[str, Point3D],
+) -> list[ProtocolSemanticViolation]:
+    """Engage-validate *position* only when it is an explicit deck target.
+
+    Automatic-selection args (``position is None``) have no single resolved
+    position to bounds-check statically -- see the scope note above.
+    """
+    if position is None:
+        return []
+    violations, _ = _validate_pipette_engage(
+        step_index=step_index,
+        command_name=command_name,
+        label=label,
+        position=position,
+        height=_height_value(args, height_field_name),
+        height_field_name=height_field_name,
+        tip_extension=tip_extension,
+        instrumented_gantry=instrumented_gantry,
+        deck=deck,
+        gantry=gantry,
+        current_poses=current_poses,
+    )
+    return violations
 
 
 def _known_command_names() -> frozenset[str]:
@@ -1357,6 +1527,145 @@ def _validate_pipette_command(
             violations.extend(engage_violations)
         return violations, tip_state
 
+    if command_name == "rinse_well":
+        violations.extend(_require_attached_tip(
+            step_index=step_index, command_name=command_name, tip_state=tip_state,
+        ))
+        well = args.get("well")
+        violations.extend(_validate_optional_engage(
+            step_index=step_index, command_name=command_name,
+            label=f"rinse_well well {well!r}", position=well, args=args,
+            height_field_name="well_height",
+            tip_extension=tip_state.tip_extension,
+            instrumented_gantry=instrumented_gantry, deck=deck, gantry=gantry,
+            current_poses=current_poses,
+        ))
+        source = args.get("source")
+        solution = args.get("solution")
+        violations.extend(_validate_stock_or_solution(
+            step_index=step_index, command_name=command_name,
+            label="rinse_well source", deck=deck, source=source, solution=solution,
+        ))
+        violations.extend(_validate_optional_engage(
+            step_index=step_index, command_name=command_name,
+            label=f"rinse_well source {source!r}", position=source, args=args,
+            height_field_name="source_height",
+            tip_extension=tip_state.tip_extension,
+            instrumented_gantry=instrumented_gantry, deck=deck, gantry=gantry,
+            current_poses=current_poses,
+        ))
+        waste = args.get("waste")
+        violations.extend(_validate_waste_or_solution(
+            step_index=step_index, command_name=command_name,
+            label="rinse_well waste", deck=deck, waste=waste, solution=solution,
+        ))
+        violations.extend(_validate_optional_engage(
+            step_index=step_index, command_name=command_name,
+            label=f"rinse_well waste {waste!r}", position=waste, args=args,
+            height_field_name="waste_height",
+            tip_extension=tip_state.tip_extension,
+            instrumented_gantry=instrumented_gantry, deck=deck, gantry=gantry,
+            current_poses=current_poses,
+        ))
+        return violations, tip_state
+
+    if command_name == "flush_pipette":
+        violations.extend(_require_attached_tip(
+            step_index=step_index, command_name=command_name, tip_state=tip_state,
+        ))
+        source = args.get("source")
+        solution = args.get("solution")
+        violations.extend(_validate_stock_or_solution(
+            step_index=step_index, command_name=command_name,
+            label="flush_pipette source", deck=deck, source=source, solution=solution,
+        ))
+        violations.extend(_validate_optional_engage(
+            step_index=step_index, command_name=command_name,
+            label=f"flush_pipette source {source!r}", position=source, args=args,
+            height_field_name="source_height",
+            tip_extension=tip_state.tip_extension,
+            instrumented_gantry=instrumented_gantry, deck=deck, gantry=gantry,
+            current_poses=current_poses,
+        ))
+        waste = args.get("waste")
+        violations.extend(_validate_waste_or_solution(
+            step_index=step_index, command_name=command_name,
+            label="flush_pipette waste", deck=deck, waste=waste, solution=solution,
+        ))
+        violations.extend(_validate_optional_engage(
+            step_index=step_index, command_name=command_name,
+            label=f"flush_pipette waste {waste!r}", position=waste, args=args,
+            height_field_name="waste_height",
+            tip_extension=tip_state.tip_extension,
+            instrumented_gantry=instrumented_gantry, deck=deck, gantry=gantry,
+            current_poses=current_poses,
+        ))
+        return violations, tip_state
+
+    if command_name == "purge_pipette":
+        violations.extend(_require_attached_tip(
+            step_index=step_index, command_name=command_name, tip_state=tip_state,
+        ))
+        source = args.get("source")
+        solution = args.get("solution")
+        violations.extend(_validate_stock_or_solution(
+            step_index=step_index, command_name=command_name,
+            label="purge_pipette source", deck=deck, source=source, solution=solution,
+        ))
+        violations.extend(_validate_optional_engage(
+            step_index=step_index, command_name=command_name,
+            label=f"purge_pipette source {source!r}", position=source, args=args,
+            height_field_name="source_height",
+            tip_extension=tip_state.tip_extension,
+            instrumented_gantry=instrumented_gantry, deck=deck, gantry=gantry,
+            current_poses=current_poses,
+        ))
+        waste = args.get("waste")
+        violations.extend(_validate_waste_or_solution(
+            step_index=step_index, command_name=command_name,
+            label="purge_pipette waste", deck=deck, waste=waste, solution=solution,
+        ))
+        violations.extend(_validate_optional_engage(
+            step_index=step_index, command_name=command_name,
+            label=f"purge_pipette waste {waste!r}", position=waste, args=args,
+            height_field_name="waste_height",
+            tip_extension=tip_state.tip_extension,
+            instrumented_gantry=instrumented_gantry, deck=deck, gantry=gantry,
+            current_poses=current_poses,
+        ))
+        return violations, tip_state
+
+    if command_name == "clear_well":
+        violations.extend(_require_attached_tip(
+            step_index=step_index, command_name=command_name, tip_state=tip_state,
+        ))
+        well = args.get("well")
+        engage_violations, _ = _validate_pipette_engage(
+            step_index=step_index, command_name=command_name,
+            label=f"clear_well well {well!r}", position=well,
+            height=_height_value(args, "well_height"),
+            height_field_name="well_height",
+            tip_extension=tip_state.tip_extension,
+            instrumented_gantry=instrumented_gantry, deck=deck, gantry=gantry,
+            current_poses=current_poses,
+        )
+        violations.extend(engage_violations)
+        waste = args.get("waste")
+        solution = args.get("solution")
+        violations.extend(_validate_waste_or_solution(
+            step_index=step_index, command_name=command_name,
+            label="clear_well waste", deck=deck, waste=waste, solution=solution,
+        ))
+        violations.extend(_validate_optional_engage(
+            step_index=step_index, command_name=command_name,
+            label=f"clear_well waste {waste!r}", position=waste, args=args,
+            height_field_name="waste_height",
+            tip_extension=tip_state.tip_extension,
+            instrumented_gantry=instrumented_gantry, deck=deck, gantry=gantry,
+            current_poses=current_poses,
+        ))
+        return violations, tip_state
+
     return violations, tip_state
 
 
@@ -1402,6 +1711,30 @@ def _validate_asmi_indentation(
             f"ASMI step_size must be positive, got {step_size}.",
         ))
 
+    detect_surface = surface_detection_enabled(normalized.method_kwargs)
+    surface_kwargs_ok = True
+    if detect_surface:
+        for field in (
+            "surface_search_step",
+            "surface_force_threshold",
+            "surface_search_max_travel",
+        ):
+            value = normalized.method_kwargs.get(field)
+            if value is None:
+                continue
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, (int, float))
+                or not math.isfinite(float(value))
+                or value <= 0
+            ):
+                surface_kwargs_ok = False
+                violations.append(_violation(
+                    step_index,
+                    "scan",
+                    f"ASMI {field} must be a positive number, got {value!r}.",
+                ))
+
     if indentation_limit_height is None:
         return violations
     finite_violation = _finite_field_violation(
@@ -1410,15 +1743,42 @@ def _validate_asmi_indentation(
     if finite_violation is not None:
         violations.append(finite_violation)
         return violations
-    deepest_abs = ref_z + indentation_limit_height
+
+    if detect_surface:
+        # The surface's Z is unknown statically; bound the worst case:
+        # the search may descend `surface_search_max_travel` below the
+        # measurement plane, and the indentation then continues
+        # `indentation_limit_height` below the surface found there.
+        if not surface_kwargs_ok:
+            return violations
+        from cubos.instruments.asmi.interface import (
+            DEFAULT_SURFACE_SEARCH_MAX_TRAVEL_MM,
+        )
+        max_travel = normalized.method_kwargs.get(
+            "surface_search_max_travel", DEFAULT_SURFACE_SEARCH_MAX_TRAVEL_MM,
+        )
+        deepest_abs = (
+            ref_z + relative_action - max_travel
+            + min(float(indentation_limit_height), 0.0)
+        )
+        limit_hint = (
+            "Raise `measurement_height`, lower `surface_search_max_travel`, "
+            "raise `indentation_limit_height`, raise the labware, or adjust "
+            "z_min."
+        )
+    else:
+        deepest_abs = ref_z + indentation_limit_height
+        limit_hint = (
+            "Raise `indentation_limit_height`, raise the labware, or adjust "
+            "z_min."
+        )
     if deepest_abs < gantry.working_volume.z_min:
         violations.append(_violation(
             step_index,
             "scan",
             f"ASMI indentation deepest absolute Z ({deepest_abs:.3f}) is "
             f"below working_volume.z_min ({gantry.working_volume.z_min}). "
-            "Raise `indentation_limit_height`, raise the labware, or adjust "
-            "z_min.",
+            + limit_hint,
         ))
     return violations
 

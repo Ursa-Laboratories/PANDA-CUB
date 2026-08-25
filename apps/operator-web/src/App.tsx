@@ -3,12 +3,17 @@ import { useQueryClient } from "@tanstack/react-query";
 import AppLayout from "./components/layout/AppLayout";
 import DeckVisualization from "./components/deck/DeckVisualization";
 import GantryPositionWidget from "./components/gantry/GantryPositionWidget";
+import InstrumentControls from "./components/gantry/InstrumentControls";
 import EditorTabs from "./components/editor/EditorTabs";
 import DeckEditor from "./components/editor/DeckEditor";
 import GantryEditor from "./components/editor/GantryEditor";
 import ProtocolEditor from "./components/editor/ProtocolEditor";
 import DataOutputPanel from "./components/data/DataOutputPanel";
-import { settingsApi, deckApi, protocolApi, gantryApi } from "./api/client";
+import StatePanel from "./components/state/StatePanel";
+import { useConfirm } from "./components/common/useConfirm";
+import { ConfigDirDialog } from "./components/common/ConfigDirDialog";
+import { UpdateBanner } from "./components/common/UpdateBanner";
+import { settingsApi, deckApi, protocolApi, gantryApi, runsApi } from "./api/client";
 import { useDeckConfigs, useDeck, useSaveDeck } from "./hooks/useDeck";
 import {
   useGantryPosition,
@@ -19,8 +24,11 @@ import {
   useInstrumentSchemas,
   useInstrumentMethods,
 } from "./hooks/useGantryPosition";
+import RunPanel from "./components/run/RunPanel";
 import { useProtocolCommands, useProtocolConfigs, useProtocol, useSaveProtocol, useValidateProtocolSetup, useRunStatus } from "./hooks/useProtocol";
 import { useExperimentData } from "./hooks/useExperimentData";
+import { useFluidStates } from "./hooks/useFluidState";
+import { buildSeedFluids, validateSeedRows } from "./utils/fluidSeeds";
 import type {
   DeckResponse,
   WellPosition,
@@ -30,6 +38,9 @@ import type {
   GantryResponse,
   WorkingVolume,
   ProtocolRunResponse,
+  FluidStateChoice,
+  RunRecord,
+  RunStateSelection,
 } from "./types";
 import type { SettingsResponse } from "./api/client";
 import * as theme from "./theme";
@@ -42,6 +53,37 @@ function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
+const RUN_TERMINAL_STATES = new Set(["succeeded", "failed", "cancelled"]);
+
+// Feature 07: translate the operator's create-new/resume-existing choice
+// into the run submission's `state` selection. "none" (never made a
+// choice) returns undefined, keeping submission on the legacy stateless
+// path — see handleRunProtocol.
+function buildStateSelection(choice: FluidStateChoice): RunStateSelection | undefined {
+  if (choice.mode === "new") {
+    const label = choice.newLabel.trim();
+    // Seed per-container starting volumes from the operator's rows. No rows
+    // → `{}`, keeping the original empty-state behavior byte-identical.
+    return { initial_state: { label: label || undefined, fluids: buildSeedFluids(choice.seeds) } };
+  }
+  if (choice.mode === "resume" && choice.resumeId !== null) {
+    return { fluid_state_id: choice.resumeId };
+  }
+  return undefined;
+}
+
+async function pollVersionedRun(runId: string, maxWaitMs = 30 * 60 * 1000): Promise<RunRecord> {
+  const deadline = Date.now() + maxWaitMs;
+  for (;;) {
+    const record = await runsApi.get(runId);
+    if (RUN_TERMINAL_STATES.has(record.state)) return record;
+    if (Date.now() > deadline) {
+      throw new Error(`Run ${runId} did not finish within ${Math.round(maxWaitMs / 1000)}s.`);
+    }
+    await new Promise((resolve) => setTimeout(resolve, 400));
+  }
+}
+
 function errorHasStatus(error: unknown, status: number): boolean {
   return (
     typeof error === "object"
@@ -51,15 +93,16 @@ function errorHasStatus(error: unknown, status: number): boolean {
   );
 }
 
-const WORKING_DECK_FILENAME = "panda-deck.yaml";
+const WORKING_DECK_FILENAME = "cub_deck.yaml";
 
 export default function App() {
   const qc = useQueryClient();
-  const [activeView, setActiveView] = useState<"Workflow" | "Results">("Workflow");
+  const [activeView, setActiveView] = useState<"Workflow" | "Run" | "Visualize" | "State" | "Results">("Workflow");
   const [activeTab, setActiveTab] = useState("Gantry");
   const [uiTheme, setUiTheme] = useState<"light" | "dark">(() => (document.documentElement.dataset.theme === "light" ? "light" : "dark"));
   const [configDir, setConfigDir] = useState<string | null>(null);
   const [browseLoading, setBrowseLoading] = useState(false);
+  const [browseDialog, setBrowseDialog] = useState<{ path: string; error: string | null } | null>(null);
 
   const [deckFile, setDeckFile] = useState<string | null>(null);
   const [gantryFile, setGantryFile] = useState<string | null>(null);
@@ -70,6 +113,19 @@ export default function App() {
   const [isRunning, setIsRunning] = useState(false);
   const [isCancelingRun, setIsCancelingRun] = useState(false);
   const [importError, setImportError] = useState<string | null>(null);
+  // Feature 07: explicit create-new-state vs resume-existing-state choice.
+  // "none" (the default) is a stateless run through the unchanged legacy
+  // /protocol/run flow; "new"/"resume" route submission through the
+  // versioned /api/v1/runs resource instead, so activeRunId tracks which
+  // resource owns the in-flight run for cancellation.
+  const [fluidStateChoice, setFluidStateChoice] = useState<FluidStateChoice>({
+    mode: "none",
+    newLabel: "",
+    resumeId: null,
+    seeds: [],
+  });
+  const [activeRunId, setActiveRunId] = useState<string | null>(null);
+  const [requestConfirm, confirmDialog] = useConfirm();
 
   // Load the local config directory on mount.
   React.useEffect(() => {
@@ -78,38 +134,69 @@ export default function App() {
       .catch((err) => console.error("Failed to load settings:", err));
   }, []);
 
+  const applyConfigDir = async (selectedPath: string): Promise<boolean> => {
+    if (
+      selectedPath !== configDir
+      && !(await confirmDiscard(
+        unsavedConfigs.length > 0,
+        "Discard unsaved config changes and switch config directory?",
+      ))
+    ) {
+      return false;
+    }
+    const savedSettings = await settingsApi.update(selectedPath);
+    const nextConfigDir = configDirFromSettings(savedSettings);
+    setConfigDir(nextConfigDir);
+    if (nextConfigDir !== configDir) {
+      setDeckFile(null);
+      setGantryFile(null);
+      setProtocolFile(null);
+      setValidationResult(null);
+      setImportError(null);
+    }
+    refreshAll();
+    return true;
+  };
+
   const handleBrowse = async () => {
     setBrowseLoading(true);
     try {
       const browseResult = await settingsApi.browse();
       const selectedPath = configDirFromSettings(browseResult);
-      if (
-        selectedPath !== configDir
-        && !confirmDiscard(
-          unsavedConfigs.length > 0,
-          "Discard unsaved config changes and switch config directory?",
-        )
-      ) {
-        return;
+      try {
+        await applyConfigDir(selectedPath);
+      } catch (err) {
+        // The picked directory was rejected (e.g. removed since picking);
+        // reopen the choice in the in-app dialog with the error visible.
+        setBrowseDialog({
+          path: selectedPath,
+          error: err instanceof Error ? err.message : String(err),
+        });
       }
-      const savedSettings = await settingsApi.update(selectedPath);
-      const nextConfigDir = configDirFromSettings(savedSettings);
-      setConfigDir(nextConfigDir);
-      if (nextConfigDir !== configDir) {
-        setDeckFile(null);
-        setGantryFile(null);
-        setProtocolFile(null);
-        setValidationResult(null);
-        setImportError(null);
-      }
-      refreshAll();
     } catch (err) {
-      // Distinguish cancellation (no selected path) from a real API failure.
-      if (err instanceof Error && err.message !== "cancelled") {
-        console.error("Browse/settings update failed:", err);
+      // The native picker reports a deliberate cancel as "No directory
+      // selected"; leave those silent. Every other failure means no picker
+      // could open at all (headless appliance, remote session, missing
+      // tkinter), so fall back to in-app path entry instead of doing
+      // nothing.
+      const message = err instanceof Error ? err.message : String(err);
+      if (message !== "No directory selected" && message !== "cancelled") {
+        setBrowseDialog({ path: configDir ?? "", error: null });
       }
     } finally {
       setBrowseLoading(false);
+    }
+  };
+
+  const submitBrowseDialog = async (path: string) => {
+    try {
+      await applyConfigDir(path);
+      setBrowseDialog(null);
+    } catch (err) {
+      setBrowseDialog({
+        path,
+        error: err instanceof Error ? err.message : String(err),
+      });
     }
   };
 
@@ -134,6 +221,7 @@ export default function App() {
   const protocolRunActive = isRunning || serverRunActive;
   const gantryPosition = useGantryPosition(true);
   const experimentData = useExperimentData();
+  const fluidStates = useFluidStates();
 
   // Local working copies of each editor's edits, kept in App state so
   // they survive tab switches (each editor unmounts on tab-away, which
@@ -222,7 +310,6 @@ export default function App() {
 
   const displayGantry = localGantry ?? gantryQuery.data ?? null;
   const gantryConnected = gantryPosition.data?.connected ?? false;
-  const calibrationWarning = gantryPosition.data?.calibration_warning ?? null;
   const workingVolume: WorkingVolume | null = displayGantry?.config.working_volume ?? null;
   const yAxisMotion = displayGantry?.config.cnc?.y_axis_motion ?? "head";
   const machineXRange: [number, number] = workingVolume
@@ -276,23 +363,24 @@ export default function App() {
   // prompts when that specific tab actually has unsaved edits, so normal
   // (non-dirty) selection and the editors' own post-save onSelectFile
   // bookkeeping calls are never intercepted.
-  const confirmDiscard = (dirty: boolean, message: string): boolean => !dirty || window.confirm(message);
+  const confirmDiscard = async (dirty: boolean, message: string): Promise<boolean> =>
+    !dirty || requestConfirm({ title: "Discard changes?", message, confirmLabel: "Discard", danger: true });
 
-  const handleImportGantry = (filename: string) => {
-    if (!confirmDiscard(gantryDirty, "Discard unsaved gantry changes?")) return;
+  const handleImportGantry = async (filename: string) => {
+    if (!(await confirmDiscard(gantryDirty, "Discard unsaved gantry changes?"))) return;
     setGantryFile(filename);
   };
 
-  const handleImportProtocol = (filename: string) => {
-    if (!confirmDiscard(protocolDirty, "Discard unsaved protocol changes?")) return;
+  const handleImportProtocol = async (filename: string) => {
+    if (!(await confirmDiscard(protocolDirty, "Discard unsaved protocol changes?"))) return;
     setProtocolFile(filename);
   };
 
   const handleImportDeck = async (filename: string) => {
-    if (!confirmDiscard(
+    if (!(await confirmDiscard(
       deckDirty,
       `Discard unsaved deck changes and overwrite ${WORKING_DECK_FILENAME} with "${filename}"?`,
-    )) return;
+    ))) return;
     setImportError(null);
     try {
       const importedDeck = await deckApi.get(filename);
@@ -328,9 +416,21 @@ export default function App() {
       setRunError("Connect gantry before running a protocol.");
       return;
     }
-    if (calibrationWarning) {
+    if (fluidStateChoice.mode === "new") {
+      // Catch bad seed rows (negative volumes, mismatched composition sums,
+      // duplicate containers) before submit so the operator gets an inline
+      // message instead of a server 4xx.
+      const seedErrors = validateSeedRows(fluidStateChoice.seeds);
+      if (seedErrors.length > 0) {
+        setRunResult(null);
+        setRunError(`Fix the fluid-state seed rows before running: ${seedErrors.join(" ")}`);
+        return;
+      }
+    }
+    const state = buildStateSelection(fluidStateChoice);
+    if (fluidStateChoice.mode === "resume" && !state) {
       setRunResult(null);
-      setRunError(calibrationWarning);
+      setRunError("Select a fluid state to resume before running.");
       return;
     }
     setIsRunning(true);
@@ -338,19 +438,44 @@ export default function App() {
     setRunResult(null);
     setRunError(null);
     qc.setQueryData(["protocol", "run-status"], { active: true, protocol_file: protocolFile });
+
+    // Every run goes through the versioned /api/v1/runs resource, including
+    // stateless ones (`state` omitted). It is the only path that yields a
+    // run_id and an event stream, which the step view needs; the legacy
+    // synchronous endpoint remains available to API clients but is no longer
+    // used here.
+    const runId = `run-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
     try {
-      const result = await protocolApi.run({
+      const submitted = await runsApi.submit({
+        run_id: runId,
         gantry_file: gantryFile,
         deck_file: deckFile,
         protocol_file: protocolFile,
+        ...(state ? { state } : {}),
       });
-      setRunResult(result);
+      // Enter the run mode only once the server has accepted the run. A
+      // rejected submission (server busy, policy, deck fingerprint) would
+      // otherwise strand the operator on a Run view whose plan and record
+      // both 404, hiding the actual reason on the tab they just left.
+      setActiveRunId(runId);
+      setActiveView("Run");
+      const finalRecord = RUN_TERMINAL_STATES.has(submitted.state)
+        ? submitted
+        : await pollVersionedRun(runId);
+      if (finalRecord.state === "succeeded") {
+        setRunResult((finalRecord.result as ProtocolRunResponse | null) ?? null);
+      } else {
+        setRunError(finalRecord.error ?? `Run ended as ${finalRecord.state}.`);
+      }
       qc.invalidateQueries({ queryKey: ["data", "campaigns"] });
+      qc.invalidateQueries({ queryKey: ["fluid-states"] });
     } catch (err: unknown) {
       setRunError(err instanceof Error ? err.message : String(err));
     } finally {
       setIsRunning(false);
       setIsCancelingRun(false);
+      // activeRunId is intentionally NOT cleared: the finished run's step
+      // list stays on screen until the next run replaces it.
       qc.invalidateQueries({ queryKey: ["protocol", "run-status"] });
     }
   };
@@ -360,8 +485,17 @@ export default function App() {
     setIsCancelingRun(true);
     setRunError(null);
     try {
-      const result = await protocolApi.cancelRun();
-      setRunError(result.warning ? `Protocol cancellation requested: ${result.warning}` : "Protocol cancellation requested.");
+      // `activeRunId` outlives its run so the Run view stays reachable, so it
+      // alone cannot say which run to cancel. `isRunning` is true only while
+      // this tab's own submission is in flight; anything else active is a run
+      // started elsewhere, which the session-wide endpoint below stops.
+      if (activeRunId && isRunning) {
+        await runsApi.cancel(activeRunId);
+        setRunError("Protocol cancellation requested.");
+      } else {
+        const result = await protocolApi.cancelRun();
+        setRunError(result.warning ? `Protocol cancellation requested: ${result.warning}` : "Protocol cancellation requested.");
+      }
     } catch (err: unknown) {
       setRunError(`Cancel failed: ${err instanceof Error ? err.message : String(err)}`);
       setIsCancelingRun(false);
@@ -393,7 +527,17 @@ export default function App() {
         </div>
       </div>
       <div style={viewToggleStyle} aria-label="Workspace view">
-        {(["Workflow", "Results"] as const).map((view) => (
+        {(
+          [
+            "Workflow",
+            // Only offered once a run exists — an empty run view is a dead
+            // tab, and the run is what the operator navigates back to.
+            ...(activeRunId ? (["Run"] as const) : []),
+            "Visualize",
+            "State",
+            "Results",
+          ] as const
+        ).map((view) => (
           <button
             key={view}
             type="button"
@@ -478,7 +622,13 @@ export default function App() {
   );
 
   const left = (
-    <div>
+    <div
+      style={
+        activeView === "Run"
+          ? { height: "100%", display: "flex", flexDirection: "column" }
+          : undefined
+      }
+    >
       {activeView === "Workflow" && (
         <>
           <EditorTabs
@@ -622,17 +772,48 @@ export default function App() {
             onRun={handleRunProtocol}
             onCancelRun={handleCancelRun}
             unsavedConfigs={unsavedConfigs}
-            canRun={gantryConnected && !calibrationWarning}
-            runDisabledReason={calibrationWarning}
+            canRun={gantryConnected}
+            runDisabledReason={null}
             isRunning={protocolRunActive}
             isCancelingRun={isCancelingRun}
             runResult={runResult}
             runError={runError}
+            fluidStateChoice={fluidStateChoice}
+            onFluidStateChoiceChange={setFluidStateChoice}
+            availableFluidStates={fluidStates.data ?? []}
           />
         </>
           )}
         </>
       )}
+      {/* The persistent right column already carries the live deck view and
+          gantry readout, so the run mode only needs to own the left region. */}
+      {activeView === "Run" && activeRunId && (
+        <div style={{ flex: "1 1 auto", minHeight: 0, display: "flex" }}>
+          <RunPanel
+            runId={activeRunId}
+            onCancel={handleCancelRun}
+            isCancelling={isCancelingRun}
+            fill
+          />
+        </div>
+      )}
+      {activeView === "Visualize" && (
+        <div style={{ display: "flex", flexDirection: "column", height: "100%", minHeight: 0 }}>
+          <h3 style={{ ...theme.panelTitle, margin: "0 0 10px", flex: "0 0 auto" }}>Deck Visualization</h3>
+          <div style={{ flex: "1 1 auto", minHeight: 0 }}>
+            <DeckVisualization
+              deck={displayDeck}
+              instruments={displayGantry?.config.instruments ?? null}
+              gantryPosition={gantryPosition.data ?? null}
+              machineXRange={machineXRange}
+              machineYRange={machineYRange}
+              yAxisMotion={yAxisMotion}
+            />
+          </div>
+        </div>
+      )}
+      {activeView === "State" && <StatePanel />}
       {activeView === "Results" && (
         <DataOutputPanel
           campaigns={experimentData.data ?? []}
@@ -661,26 +842,51 @@ export default function App() {
   );
 
   const bottomRight = (
-    <GantryPositionWidget
-      position={gantryPosition.data ?? null}
-      workingVolume={workingVolume}
-      gantryFile={displayGantry ? gantryFile : null}
-      gantry={displayGantry}
-      isRunning={protocolRunActive}
-      onSaveCalibrated={async (filename, body) => {
-        const previousGantryFile = gantryFile;
-        const saved = await saveGantry.mutateAsync({ filename, body });
-        setGantryFile(saved.filename);
-        setLocalGantry(null);
-        if (previousGantryFile && saved.filename !== previousGantryFile) {
-          await gantryApi.disconnect();
-          await gantryApi.connect(saved.filename);
-        }
-      }}
-    />
+    <div>
+      <GantryPositionWidget
+        position={gantryPosition.data ?? null}
+        workingVolume={workingVolume}
+        gantryFile={displayGantry ? gantryFile : null}
+        gantry={displayGantry}
+        isRunning={protocolRunActive}
+        onSaveCalibrated={async (filename, body) => {
+          const previousGantryFile = gantryFile;
+          const saved = await saveGantry.mutateAsync({ filename, body });
+          setGantryFile(saved.filename);
+          setLocalGantry(null);
+          if (previousGantryFile && saved.filename !== previousGantryFile) {
+            await gantryApi.disconnect();
+            await gantryApi.connect(saved.filename);
+          }
+        }}
+      />
+      <InstrumentControls
+        connected={gantryConnected}
+        isRunning={protocolRunActive}
+      />
+    </div>
   );
 
-  return <AppLayout header={headerBar} left={left} topRight={topRight} bottomRight={bottomRight} />;
+  return (
+    <>
+      <AppLayout
+        banner={<UpdateBanner requestConfirm={requestConfirm} />}
+        header={headerBar}
+        left={left}
+        topRight={topRight}
+        bottomRight={bottomRight}
+      />
+      {browseDialog && (
+        <ConfigDirDialog
+          initialPath={browseDialog.path}
+          error={browseDialog.error}
+          onSubmit={submitBrowseDialog}
+          onCancel={() => setBrowseDialog(null)}
+        />
+      )}
+      {confirmDialog}
+    </>
+  );
 }
 
 const brandMarkStyle: React.CSSProperties = {

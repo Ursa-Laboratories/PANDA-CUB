@@ -3,11 +3,53 @@
 from abc import abstractmethod
 
 from cubos.instruments.base_instrument import BaseInstrument
+from cubos.instruments.pipette.liquid_class import (
+    IDENTITY_CORRECTION,
+    LiquidClassConfigError,
+    LiquidClassCorrection,
+)
 from cubos.instruments.pipette.models import AspirateResult, MixResult, PipetteStatus
 
 
 class PipetteInstrument(BaseInstrument):
-    """Base class for pipette implementations."""
+    """Base class for pipette implementations.
+
+    Speed semantics
+    ---------------
+    Every ``speed`` argument below is a **normalized 0-100 percentage of the
+    instrument's usable speed range**, not a physical unit. Each driver maps
+    it onto whatever its hardware takes -- an index, steps per second, a
+    millimetres-per-second figure -- so a protocol stays portable across
+    vendors.
+
+    This contract was written once two vendors existed. ``OpentronsPipette``
+    still discards ``speed`` and lets its firmware pick a velocity (see the
+    ``TODO(iter)`` there); honoring it would change motion on machines
+    already in use, so that is a deliberate follow-up rather than part of
+    this contract's introduction.
+    """
+
+    @property
+    def liquid_classes(self) -> dict[str, LiquidClassCorrection]:
+        """Return this instrument's configured liquid-class corrections.
+
+        Empty by default (no vendor wiring required to opt out). Vendors
+        that support per-liquid correction store parsed corrections on
+        ``self._liquid_classes``.
+        """
+        return getattr(self, "_liquid_classes", {})
+
+    def correction_for(self, liquid_class: str | None) -> LiquidClassCorrection:
+        """Return the correction for *liquid_class*, or identity when unset."""
+        if liquid_class is None:
+            return IDENTITY_CORRECTION
+        try:
+            return self.liquid_classes[liquid_class]
+        except KeyError:
+            raise LiquidClassConfigError(
+                f"Unknown liquid class {liquid_class!r}. Configured: "
+                f"{sorted(self.liquid_classes)}."
+            ) from None
 
     @property
     @abstractmethod

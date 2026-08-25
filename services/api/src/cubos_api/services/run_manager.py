@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import tempfile
 import threading
 import time
 import traceback
@@ -13,9 +14,15 @@ from typing import Any
 
 import yaml
 
+from cubos.data import DataStore
+from cubos.deck import load_deck_from_yaml
+from cubos.deck.errors import DeckLoaderError
+
 from cubos_api.config import CubOSSettings, get_settings
 from cubos_api.models.runs import RunRecord, RunSubmission
+from cubos_api.models.state import RunStateSelection
 from cubos_api.services.run_store import RunStore, sha256_text
+from cubos_api.services.step_observer import RunStoreStepObserver
 from cubos_api.services.yaml_io import resolve_config_path
 
 
@@ -86,7 +93,13 @@ def _check_protocol_policy(
                 raise RunPolicyError(f"step {index}: instrument {instrument!r} is not allowed")
 
 
-def _mock_execute(*, gantry_path: Path, deck_path: Path, protocol_path: Path) -> Any:
+def _mock_execute(
+    *,
+    gantry_path: Path,
+    deck_path: Path,
+    protocol_path: Path,
+    step_observer: Any | None = None,
+) -> Any:
     from cubos.protocol_engine.setup import setup_protocol
 
     protocol, context = setup_protocol(
@@ -95,6 +108,7 @@ def _mock_execute(*, gantry_path: Path, deck_path: Path, protocol_path: Path) ->
         str(protocol_path),
         gantry=None,
         mock_mode=True,
+        step_observer=step_observer,
     )
     context.gantry.connect_instruments()
     try:
@@ -120,6 +134,11 @@ class RunManager:
             self.store.append_event(record.run_id, state="failed", message=record.error)
             self.store.write(record)
 
+    @property
+    def active_run_id(self) -> str | None:
+        with self._lock:
+            return self._active_run_id
+
     def submit(self, submission: RunSubmission) -> RunRecord:
         run_id = submission.run_id or uuid.uuid4().hex
         with self._lock:
@@ -130,12 +149,14 @@ class RunManager:
 
             gantry_yaml, deck_yaml, protocol_yaml = self._resolve_bundle(submission)
             self._validate_bundle(gantry_yaml, deck_yaml, protocol_yaml)
+            fluid_state_id = self._resolve_run_state(deck_yaml, submission.state)
             record = RunRecord(
                 run_id=run_id,
                 state="queued",
                 created_at=time.time(),
                 mock_mode=submission.mock_mode,
                 metadata=submission.metadata,
+                fluid_state_id=fluid_state_id,
             )
             self.store.create(
                 record,
@@ -216,6 +237,58 @@ class RunManager:
         if expected_deck and sha256_text(deck_yaml) != expected_deck:
             raise RunPolicyError("deck configuration digest does not match the device pin")
 
+    def _resolve_run_state(
+        self, deck_yaml: str, state: RunStateSelection | None
+    ) -> int | None:
+        """Create or resume the run's fluid state, ahead of hardware execution.
+
+        Returns ``None`` for a stateless run (``state`` omitted entirely —
+        every run submitted before Feature 07 keeps behaving exactly as it
+        did). ``cubos.data`` state exceptions (not-found, deck-fingerprint
+        mismatch, reconciliation-required) propagate unchanged so the router
+        can map each to a distinct HTTP status.
+        """
+        if state is None:
+            return None
+
+        tmp_path: Path | None = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                "w", suffix=".yaml", delete=False, encoding="utf-8"
+            ) as tmp:
+                tmp.write(deck_yaml)
+                tmp_path = Path(tmp.name)
+            try:
+                deck = load_deck_from_yaml(tmp_path)
+            except DeckLoaderError as exc:
+                raise RunPolicyError(f"cannot load run deck: {exc}") from exc
+
+            store = DataStore(self.settings.data_db_path)
+            try:
+                if state.initial_state is not None:
+                    fluids = {
+                        key: {
+                            "volume_ul": item.volume_ul,
+                            "composition": item.composition,
+                        }
+                        for key, item in state.initial_state.fluids.items()
+                    }
+                    return store.create_fluid_state(
+                        str(tmp_path),
+                        deck,
+                        label=state.initial_state.label,
+                        initial_fluids=fluids,
+                    )
+                assert state.fluid_state_id is not None
+                return store.resume_fluid_state(
+                    state.fluid_state_id, str(tmp_path), deck
+                )
+            finally:
+                store.close()
+        finally:
+            if tmp_path is not None:
+                tmp_path.unlink(missing_ok=True)
+
     def _execute(self, run_id: str) -> None:
         from cubos_api.routers import gantry as gantry_router
 
@@ -228,6 +301,9 @@ class RunManager:
         self.store.append_event(run_id, state="running", message="execution started")
         self.store.write(record)
 
+        # Advisory progress reporting; see cubos.protocol_engine.observer for
+        # why an observer can never fail a run.
+        step_observer = RunStoreStepObserver(self.store, run_id)
         gate_acquired = False
         try:
             gantry_router.begin_run(protocol_file="protocol.yaml")
@@ -237,6 +313,7 @@ class RunManager:
                     gantry_path=directory / "gantry.yaml",
                     deck_path=directory / "deck.yaml",
                     protocol_path=directory / "protocol.yaml",
+                    step_observer=step_observer,
                 )
             else:
                 raw_result = gantry_router.run_protocol_on_session(
@@ -247,6 +324,8 @@ class RunManager:
                     deck_file="deck.yaml",
                     protocol_file="protocol.yaml",
                     db_path=self.settings.data_db_path,
+                    fluid_state_id=record.fluid_state_id,
+                    step_observer=step_observer,
                 )
             result = _jsonable(raw_result)
             record = self.store.read(run_id) or record

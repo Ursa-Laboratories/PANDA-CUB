@@ -65,10 +65,16 @@ python -m cubos.tools.validate_setup \
 - `gantry/cub_xl_panda.yaml` - PANDA estimate with placeholder camera/capper
   instrument entries; those placeholders parse as config data but will not
   instantiate until real instrument drivers are registered.
+- `gantry/cub_xl_panda_imaging.yaml` - PANDA with the imaging stack live:
+  FLIR camera (`camera/flir`) and Pawduino lights (`lighting/pawduino`) as
+  offline-by-default instruments; pairs with
+  `protocol/panda/imaging_demo.yaml` (move -> set_lights -> capture,
+  plus a one-step `image_well`).
 - `deck/asmi_deck.yaml`, `deck/sterling_deck.yaml`,
   `deck/filmetrics_deck.yaml`, `deck/panda_deck.yaml`,
   `deck/sharc_uv_deck.yaml`.
 - `protocol/asmi/move_a1.yaml`, `protocol/asmi/indentation.yaml`,
+  `protocol/asmi/indentation_detect_surface.yaml`,
   `protocol/sterling/park.yaml`, `protocol/sterling/vial_scan.yaml`,
   `protocol/sterling/2_instrument_vial_scan.yaml`,
   `protocol/filmetrics/scan.yaml`, `protocol/sharc_uv/curing_scan.yaml`,
@@ -94,6 +100,9 @@ sanity check, not for motion math.
 - ASMI `indentation_limit_height` (top-level on `scan`): signed
   labware-relative offset (mm above the well surface; negative = below)
   for the deepest descent plane. Must be at or below `measurement_height`.
+  With `detect_surface: true` in `method_kwargs` it is instead anchored
+  to the sensor-detected sample surface and must be at or below `0`
+  (see `protocol/asmi/indentation_detect_surface.yaml`).
 - gantry `safe_z`: absolute deck-frame Z used for inter-labware travel
   (the only absolute Z in the engagement path)
 

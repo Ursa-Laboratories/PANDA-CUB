@@ -26,7 +26,9 @@ from cubos.gantry.instrument_loader import build_instrumented_gantry
 EXPECTED_TYPES = [
     "asmi",
     "camera",
+    "capper",
     "filmetrics",
+    "lighting",
     "mounted_tool",
     "pipette",
     "potentiostat",
@@ -432,19 +434,22 @@ class TestGetSupportedVendors:
         assert get_supported_vendors("asmi") == ["vernier"]
 
     def test_camera_vendors(self):
-        assert get_supported_vendors("camera") == ["mount_only", "raspberry_pi"]
+        assert get_supported_vendors("camera") == ["flir", "mount_only", "opencv", "raspberry_pi"]
 
     def test_filmetrics_vendors(self):
         assert get_supported_vendors("filmetrics") == ["kla"]
+
+    def test_lighting_vendors(self):
+        assert get_supported_vendors("lighting") == ["pawduino"]
 
     def test_mounted_tool_vendors(self):
         assert get_supported_vendors("mounted_tool") == ["mount_only"]
 
     def test_pipette_vendors(self):
-        assert get_supported_vendors("pipette") == ["opentrons"]
+        assert get_supported_vendors("pipette") == ["opentrons", "sartorius"]
 
     def test_potentiostat_vendors(self):
-        assert get_supported_vendors("potentiostat") == ["admiral"]
+        assert get_supported_vendors("potentiostat") == ["admiral", "emstat"]
 
     def test_uv_curing_vendors(self):
         assert get_supported_vendors("uv_curing") == ["excelitas"]
@@ -566,6 +571,7 @@ class TestGetInstrumentClass:
             ("mounted_tool", "mount_only"),
             ("pipette", "opentrons"),
             ("potentiostat", "admiral"),
+            ("potentiostat", "emstat"),
             ("uv_curing", "excelitas"),
             ("uvvis_ccs", "thorlabs"),
         ]
@@ -602,6 +608,10 @@ class TestGetInstrumentClass:
         from cubos.instruments.potentiostat.vendors.admiral import AdmiralPotentiostat
         assert get_instrument_class("potentiostat", "admiral") is AdmiralPotentiostat
 
+    def test_potentiostat_emstat_class(self):
+        from cubos.instruments.potentiostat.vendors.emstat import EmstatPotentiostat
+        assert get_instrument_class("potentiostat", "emstat") is EmstatPotentiostat
+
     def test_uv_curing_class(self):
         from cubos.instruments.uv_curing.vendors.excelitas import ExcelitasUVCuring
         assert get_instrument_class("uv_curing", "excelitas") is ExcelitasUVCuring
@@ -626,6 +636,7 @@ class TestValidateInstrument:
             ("mounted_tool", "mount_only"),
             ("pipette", "opentrons"),
             ("potentiostat", "admiral"),
+            ("potentiostat", "emstat"),
             ("uv_curing", "excelitas"),
             ("uvvis_ccs", "thorlabs"),
         ]

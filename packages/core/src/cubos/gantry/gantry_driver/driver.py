@@ -15,6 +15,7 @@ import logging
 import math
 import os
 import re
+import threading
 import time
 from pathlib import Path
 from typing import Optional, Tuple
@@ -38,6 +39,30 @@ from .logger import set_up_command_logger, set_up_mill_logger
 DEFAULT_FEED_RATE = 2000
 HOMING_TIMEOUT = 90
 ERROR_22_MAX_RETRIES = 2
+
+def looks_like_connection_loss(value: Exception | str) -> bool:
+    """Return true when an error looks like the serial link itself died.
+
+    Hardware validation on the CubXL showed the controller dropping off the
+    USB bus at a hard-limit trip (supply-rail glitch reboots the board and
+    re-enumerates the USB bridge). The stale file descriptor then times out
+    or raises OS-level errors on every exchange.
+    """
+    message = str(value).lower()
+    return any(
+        token in message
+        for token in (
+            "timed out",
+            "device not configured",
+            "errno 6",
+            "input/output error",
+            "bad file descriptor",
+            "device reports readiness to read but returned no data",
+            "write failed",
+            "no initial grbl status",
+        )
+    )
+
 
 # Compile regex patterns for extracting coordinates from the mill status
 wpos_pattern = re.compile(r"WPos:([\d.-]+),([\d.-]+),([\d.-]+)")
@@ -64,6 +89,23 @@ class Mill:
         self.config = {}
         self._init_state()
         self.ser_mill: serial.Serial = None
+        self._write_lock = threading.Lock()
+
+    def _write_serial(self, data: bytes) -> None:
+        """Write bytes to the controller under the write lock.
+
+        Realtime characters (``?``, ``!``, ``~``, jog cancel ``0x85``, soft
+        reset ``0x18``) are sent from threads that deliberately do not hold
+        the session operation lock, so two threads can reach the serial port
+        at once. GRBL itself strips realtime characters out of the stream
+        wherever they appear — even mid-line — but pyserial makes no
+        thread-safety guarantee for concurrent ``write()`` calls. This lock
+        makes each write atomic at the port. It only serializes the write
+        syscall, never a command/response cycle, so realtime characters
+        still bypass waiting on in-flight commands.
+        """
+        with self._write_lock:
+            self.ser_mill.write(data)
 
     def _init_state(self):
         """Initialize state attributes for a fresh, unconnected mill."""
@@ -239,7 +281,7 @@ class Mill:
         # everything except $X and $H while in alarm state.
         initial_status = ""
         for _ in range(3):
-            self.ser_mill.write(b"?")
+            self._write_serial(b"?")
             time.sleep(0.2)
             initial_status = self._read_serial()
             if initial_status:
@@ -364,11 +406,11 @@ class Mill:
             self.command_logger.debug("%s", command)
 
             if command == "$$":
-                self.ser_mill.write(str(command).encode(encoding="ascii") + b"\n")
+                self._write_serial(str(command).encode(encoding="ascii") + b"\n")
                 return self._collect_grbl_settings_response()
 
             for attempt in range(ERROR_22_MAX_RETRIES + 1):
-                self.ser_mill.write(str(command).encode(encoding="ascii") + b"\n")
+                self._write_serial(str(command).encode(encoding="ascii") + b"\n")
                 mill_response = self._read_serial().lower()
                 if not command.startswith("$"):
                     mill_response = self._wait_until_idle(
@@ -409,7 +451,7 @@ class Mill:
     def stop(self):
         """Send GRBL feed hold and verify the controller entered Hold."""
         self.feed_hold_realtime()
-        self.ser_mill.write(b"?")
+        self._write_serial(b"?")
         time.sleep(0.05)
         status = self._read_serial()
         if "hold" not in status.lower():
@@ -418,12 +460,12 @@ class Mill:
     def feed_hold_realtime(self) -> None:
         """Send GRBL realtime feed hold without line protocol or reads."""
         self._require_open_serial()
-        self.ser_mill.write(b"!")
+        self._write_serial(b"!")
 
     def resume(self) -> None:
         """Resume a feed-held GRBL controller with realtime cycle start."""
         self._require_open_serial()
-        self.ser_mill.write(b"~")
+        self._write_serial(b"~")
 
     def jog(self, x: float = 0, y: float = 0, z: float = 0,
             feed_rate: float = DEFAULT_FEED_RATE) -> None:
@@ -450,7 +492,7 @@ class Mill:
             return
         cmd = f"$J=G91 {' '.join(parts)} F{feed_rate}"
         self.logger.debug("Jog command: %s", cmd)
-        self.ser_mill.write((cmd + "\n").encode("ascii"))
+        self._write_serial((cmd + "\n").encode("ascii"))
         response = self._read_serial().lower()
         if (
             "error" in response
@@ -467,13 +509,13 @@ class Mill:
     def jog_cancel(self) -> None:
         """Cancel any in-progress jog motion immediately."""
         self._require_open_serial()
-        self.ser_mill.write(b"\x85")
+        self._write_serial(b"\x85")
 
     def unlock(self):
         """Unlock the mill by sending $X directly over serial."""
         self._require_open_serial()
         self.logger.info("Sending unlock ($X)")
-        self.ser_mill.write(b"$X\n")
+        self._write_serial(b"$X\n")
         deadline = time.time() + 2
         while time.time() < deadline:
             line = self.ser_mill.readline().decode("ascii", errors="replace").strip()
@@ -492,16 +534,76 @@ class Mill:
         """Soft reset the mill (GRBL Ctrl-X / 0x18)."""
         self._require_open_serial()
         self.logger.info("Sending soft reset (0x18)")
-        self.ser_mill.write(b"\x18")
+        self._write_serial(b"\x18")
         time.sleep(1.0)
         while self.ser_mill.in_waiting:
             line = self.ser_mill.readline().decode("ascii", errors="replace").strip()
             self.logger.debug("Soft reset response: %s", line)
 
+    def reconnect(self, attempts: int = 4, delay_s: float = 1.0) -> None:
+        """Re-open the serial port after the controller dropped off the bus.
+
+        The USB bridge re-enumerates with the same device name, but the old
+        file descriptor stays dead — every read times out. Prefer the
+        previously connected port name; fall back to auto-scan on the final
+        attempt in case the name changed. Enumeration is not instant, so
+        retry with a delay.
+        """
+        port = self.connected_port()
+        try:
+            if self.ser_mill is not None:
+                self.ser_mill.close()
+        except Exception as exc:
+            self.logger.warning("Closing stale serial handle failed: %s", exc)
+        self.ser_mill = None
+        self.active_connection = False
+        last_error: Exception | None = None
+        for attempt in range(1, attempts + 1):
+            time.sleep(delay_s)
+            try:
+                self.connect(port=port if attempt < attempts else None)
+            except MillConnectionError as exc:
+                last_error = exc
+                self.logger.warning(
+                    "Serial reconnect attempt %d/%d failed: %s",
+                    attempt,
+                    attempts,
+                    exc,
+                )
+                continue
+            self.logger.info("Serial reconnect succeeded on attempt %d", attempt)
+            return
+        raise MillConnectionError(
+            "Controller connection lost and serial reconnect failed after "
+            f"{attempts} attempts"
+        ) from last_error
+
     def soft_reset_and_unlock(self):
-        """Soft reset followed by unlock — single serial sequence."""
-        self.soft_reset()
-        self.unlock()
+        """Soft reset followed by unlock — single serial sequence.
+
+        Some controller boards drop off the USB bus when a hard-limit trip
+        glitches their supply rail; the first symptom is the unlock read
+        timing out here. Reconnect once and retry the unlock — after a bus
+        drop the board has already rebooted, so the reset part is moot.
+        """
+        try:
+            self.soft_reset()
+            self.unlock()
+        except (
+            MillConnectionError,
+            CommandExecutionError,
+            OSError,
+            serial.SerialException,
+        ) as exc:
+            if not looks_like_connection_loss(exc):
+                raise
+            self.logger.warning(
+                "Controller stopped responding during reset/unlock (%s); "
+                "attempting serial reconnect.",
+                exc,
+            )
+            self.reconnect()
+            self.unlock()
 
     def home(self, timeout=HOMING_TIMEOUT):
         """Home the mill with a timeout."""
@@ -532,6 +634,12 @@ class Mill:
                 self.logger.info("Homing completed")
                 self.homed = True
                 break
+
+            if "hold" in status.lower():
+                raise StatusReturnError(
+                    "Homing paused by feed hold "
+                    f"({status}). Resume or reset/unlock before retrying."
+                )
 
             if "alarm" in status.lower():
                 self.logger.warning("Homing failed, trying again...")
@@ -575,7 +683,7 @@ class Mill:
         status = self._read_serial()
 
         while status.strip().lower() in ["", "ok"] and attempt_limit > 0:
-            self.ser_mill.write(b"?")
+            self._write_serial(b"?")
             time.sleep(0.05)
             status = self._read_serial()
             attempt_limit -= 1
@@ -669,7 +777,7 @@ class Mill:
         """
         self._require_open_serial()
         for _ in range(15):
-            self.ser_mill.write(b"?")
+            self._write_serial(b"?")
             time.sleep(0.15)
             status = self._read_serial()
             match = wco_pattern.search(status)
@@ -700,7 +808,7 @@ class Mill:
         if not self.is_connected():
             return ""
         try:
-            self.ser_mill.write(b"?")
+            self._write_serial(b"?")
             time.sleep(0.1)
             raw = ""
             for _ in range(5):
@@ -715,40 +823,16 @@ class Mill:
                 f"Raw status query failed: {exc}"
             ) from exc
 
-    def current_coordinates(self) -> Coordinates:
+    def _parse_position_from_status(self, status: str) -> Optional[Coordinates]:
+        """Extract deck-frame WPos from a status frame, whatever the $10 mode.
+
+        Prefers WPos when present; falls back to MPos minus the cached WCO.
+        Also refreshes the cached WCO whenever the frame carries one.
+        Returns ``None`` when the frame has neither position field (or MPos
+        with no WCO available) — parsing is deliberately independent of the
+        configured ``$10`` value so a controller in an unexpected reporting
+        mode still yields a position.
         """
-        Get the current coordinates of the mill.
-
-        Returns:
-            Coordinates: current GRBL WPos in the CubOS deck frame.
-        """
-        self._require_open_serial()
-        self.ser_mill.write(b"?")
-        time.sleep(0.05)
-        status = self._read_serial()
-        attempts = 0
-        while (not status or status[0] != "<") and attempts < 3:
-            if "alarm" in status.lower() or "error" in status.lower():
-                self.logger.error("Error in status: %s", status)
-                self.last_status = status
-                raise StatusReturnError(f"Error in status: {status}")
-            if "ok" in status.lower():
-                self.logger.debug("OK in status: %s", status)
-            status = self._read_serial()
-            attempts += 1
-
-        self.last_status = status
-        status_mode = int(self.config.get("$10", "0"))
-
-        if int(status_mode) not in [0, 1, 2, 3]:
-            self.logger.error("Invalid status mode")
-            raise ValueError("Invalid status mode")
-
-        max_attempts = 3
-        pattern = wpos_pattern if status_mode in [0, 2] else mpos_pattern
-        coord_type = "WPos" if status_mode in [0, 2] else "MPos"
-
-        # Update cached WCO whenever GRBL includes it in the status
         wco_match = wco_pattern.search(status)
         if wco_match:
             self._wco = Coordinates(
@@ -757,53 +841,79 @@ class Mill:
                 float(wco_match.group(3)),
             )
 
-        for i in range(max_attempts):
-            match = pattern.search(status)
-            if match:
-                x_coord = round(float(match.group(1)), 3)
-                y_coord = round(float(match.group(2)), 3)
-                z_coord = round(float(match.group(3)), 3)
-                if coord_type == "MPos":
-                    if self._wco is None:
-                        self.seed_wco()
-                    if self._wco is not None:
-                        x_coord = round(x_coord - self._wco.x, 3)
-                        y_coord = round(y_coord - self._wco.y, 3)
-                        z_coord = round(z_coord - self._wco.z, 3)
-                    else:
-                        raise LocationNotFound(
-                            "MPos reported but WCO was unavailable; cannot "
-                            "derive safe WPos coordinates."
-                        )
+        match = wpos_pattern.search(status)
+        if match:
+            return Coordinates(
+                round(float(match.group(1)), 3),
+                round(float(match.group(2)), 3),
+                round(float(match.group(3)), 3),
+            )
+
+        match = mpos_pattern.search(status)
+        if match:
+            if self._wco is None:
+                self.seed_wco()
+            if self._wco is None:
+                return None
+            return Coordinates(
+                round(float(match.group(1)) - self._wco.x, 3),
+                round(float(match.group(2)) - self._wco.y, 3),
+                round(float(match.group(3)) - self._wco.z, 3),
+            )
+        return None
+
+    def current_coordinates(self) -> Coordinates:
+        """
+        Get the current coordinates of the mill.
+
+        Returns:
+            Coordinates: current GRBL WPos in the CubOS deck frame.
+
+        Raises:
+            LocationNotFound: no parsable position after several queries —
+                callers that can proceed safely without a position (absolute
+                moves) may catch this and fall back.
+        """
+        self._require_open_serial()
+        max_attempts = 4
+        status = ""
+        for attempt in range(max_attempts):
+            self._write_serial(b"?")
+            time.sleep(0.05)
+            status = self._read_serial()
+            # Skim past stale acknowledgments ("ok") and blank reads that
+            # can queue ahead of the status frame mid-protocol.
+            skims = 0
+            while (not status or status[0] != "<") and skims < 6:
+                if status and (
+                    "alarm" in status.lower() or "error" in status.lower()
+                ):
+                    self.logger.error("Error in status: %s", status)
+                    self.last_status = status
+                    raise StatusReturnError(f"Error in status: {status}")
+                status = self._read_serial()
+                skims += 1
+
+            self.last_status = status
+            coords = self._parse_position_from_status(status)
+            if coords is not None:
                 self.logger.info(
                     "WPos coordinates: X = %s, Y = %s, Z = %s",
-                    x_coord,
-                    y_coord,
-                    z_coord,
+                    coords.x, coords.y, coords.z,
                 )
-                break
-            else:
-                self.logger.warning(
-                    "%s coordinates not found in status: %r. Retrying query...",
-                    coord_type,
-                    status,
-                )
-                if i == max_attempts - 1:
-                    self.logger.error(
-                        "Error occurred while getting %s coordinates", coord_type
-                    )
-                    raise LocationNotFound
-                # Re-query status for next attempt
-                time.sleep(0.2)
-                self.ser_mill.write(b"?")
-                time.sleep(0.2)
-                status = self._read_serial()
-                retry_attempts = 0
-                while (not status or status[0] != "<") and retry_attempts < 3:
-                    status = self._read_serial()
-                    retry_attempts += 1
+                return coords
 
-        return Coordinates(x_coord, y_coord, z_coord)
+            self.logger.warning(
+                "No position in GRBL status (attempt %d/%d): %r",
+                attempt + 1, max_attempts, status,
+            )
+            time.sleep(0.2)
+
+        self.logger.error("Error occurred while getting WPos coordinates")
+        raise LocationNotFound(
+            f"No parsable position in GRBL status after {max_attempts} "
+            f"queries; last frame: {status!r}"
+        )
 
     def _require_open_serial(self) -> None:
         if self.ser_mill is None or not getattr(self.ser_mill, "is_open", False):
@@ -846,11 +956,24 @@ class Mill:
         self._validate_target_coordinates(goto)
         if travel_z is not None:
             self._validate_finite_coordinate(travel_z, "travel Z")
-        current_coordinates = self.current_coordinates()
+        # The current position only prunes redundant steps below; every
+        # emitted G-code is absolute, so a transient status-read failure
+        # must not kill a run mid-motion. Fall back to emitting the full
+        # unpruned sequence instead.
+        try:
+            current_coordinates = self.current_coordinates()
+        except LocationNotFound as exc:
+            self.logger.warning(
+                "Position read failed before move (%s); emitting full "
+                "absolute move sequence without pruning.", exc,
+            )
+            current_coordinates = None
 
         target_coordinates = goto
 
-        if self._is_already_at_target(target_coordinates, current_coordinates):
+        if current_coordinates is not None and self._is_already_at_target(
+            target_coordinates, current_coordinates
+        ):
             self.logger.debug(
                 "Mill is already at the target coordinates of [%s, %s, %s]",
                 x_coordinate,
@@ -916,15 +1039,19 @@ class Mill:
         motion — combining axes in a single G01 would couple their
         motion into a straight interpolation that could graze
         obstacles the caller didn't plan for.
+
+        ``current_coordinates`` may be ``None`` (position read failed);
+        every axis is then emitted unconditionally — safe because the
+        commands are absolute.
         """
         f = f" F{DEFAULT_FEED_RATE}"
         self._validate_target_coordinates(target_coordinates)
         commands = []
-        if target_coordinates.x != current_coordinates.x:
+        if current_coordinates is None or target_coordinates.x != current_coordinates.x:
             commands.append(f"G01 X{target_coordinates.x}{f}")
-        if target_coordinates.y != current_coordinates.y:
+        if current_coordinates is None or target_coordinates.y != current_coordinates.y:
             commands.append(f"G01 Y{target_coordinates.y}{f}")
-        if target_coordinates.z != current_coordinates.z:
+        if current_coordinates is None or target_coordinates.z != current_coordinates.z:
             commands.append(f"G01 Z{target_coordinates.z}{f}")
         return commands
 
@@ -941,16 +1068,21 @@ class Mill:
         (or same-Y) move skips that axis, and a final Z matching
         ``travel_z`` skips the descent. X and Y always move in
         separate G-codes — no diagonal.
+
+        ``current_coordinates`` may be ``None`` (position read failed);
+        the full lift → X → Y → descend sequence is then emitted
+        unconditionally — safe because the commands are absolute and the
+        lift happens first.
         """
         f = f" F{DEFAULT_FEED_RATE}"
         self._validate_target_coordinates(target_coordinates)
         self._validate_finite_coordinate(travel_z, "travel Z")
         commands = []
-        if current_coordinates.z != travel_z:
+        if current_coordinates is None or current_coordinates.z != travel_z:
             commands.append(f"G01 Z{travel_z}{f}")
-        if target_coordinates.x != current_coordinates.x:
+        if current_coordinates is None or target_coordinates.x != current_coordinates.x:
             commands.append(f"G01 X{target_coordinates.x}{f}")
-        if target_coordinates.y != current_coordinates.y:
+        if current_coordinates is None or target_coordinates.y != current_coordinates.y:
             commands.append(f"G01 Y{target_coordinates.y}{f}")
         if target_coordinates.z != travel_z:
             commands.append(f"G01 Z{target_coordinates.z}{f}")
